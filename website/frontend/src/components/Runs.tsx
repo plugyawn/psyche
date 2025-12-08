@@ -6,6 +6,7 @@ import { ApiGetRuns } from 'shared'
 import { Sort } from './Sort.js'
 import { text } from '../fonts.js'
 import AnimatedTokensCounter from './AnimatedTokensCounter.js'
+import { gold } from '../colors.js'
 
 const RunsContainer = styled.div`
 	height: 100%;
@@ -70,6 +71,17 @@ const sortFuncs = {
 		Number(b.size - a.size),
 } as const
 
+const NoteBox = styled.div`
+	border: 2px solid ${gold[600]};
+	background: ${gold[300]};
+	.theme-dark & {
+		background: ${gold[600]};
+		border-color: ${gold[200]};
+		color: ${gold[100]};
+	}
+	padding: 2px 4px;
+`
+
 export function Runs({
 	runs,
 	totalTokens,
@@ -105,6 +117,12 @@ export function Runs({
 					/>
 				</GlobalStat>
 			</GlobalStats>
+			<RunsHeader>
+				<NoteBox className={text['body/sm/medium']}>
+					training runs by Nous Research are currently paused for network
+					upgrades
+				</NoteBox>
+			</RunsHeader>
 			<RunsHeader>
 				<RadioSelectBar
 					selected={runTypeFilter}
