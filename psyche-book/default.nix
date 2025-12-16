@@ -1,8 +1,5 @@
 {
   lib,
-  mdbook,
-  fetchFromGitHub,
-  rustPlatform,
   stdenvNoCC,
   mdbook-mermaid,
   mdbook-linkcheck,
@@ -11,29 +8,6 @@
   rustPackages,
   rustPackageNames,
 }:
-let
-  mdbook-0-4-47 = mdbook.overrideAttrs (
-    oldAttrs:
-    let
-      version = "0.4.47";
-      src = fetchFromGitHub {
-        owner = "rust-lang";
-        repo = "mdBook";
-        tag = "v${version}";
-        hash = "sha256-XTvC2pGRVat0kOybNb9TziG32wDVexnFx2ahmpUFmaA=";
-      };
-    in
-    {
-      inherit version src;
-      cargoDeps = rustPlatform.fetchCargoVendor {
-        inherit (oldAttrs) pname;
-        inherit version src;
-        allowGitDependencies = false;
-        hash = "sha256-ASPRBAB+elJuyXpPQBm3WI97wD3mjoO1hw0fNHc+KAw=";
-      };
-    }
-  );
-in
 stdenvNoCC.mkDerivation {
   __structuredAttrs = true;
 
@@ -41,7 +15,6 @@ stdenvNoCC.mkDerivation {
   src = ./.;
 
   nativeBuildInputs = [
-    mdbook-0-4-47
     mdbook-mermaid
     mdbook-linkcheck
   ];
