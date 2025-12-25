@@ -25,6 +25,10 @@ try:
     import torch
 except Exception as e:
     print(f"[psyche-env] Failed to import torch: {e}", file=sys.stderr)
+    print(
+        "[psyche-env] If you're running a packaged bundle, run: bash scripts/bootstrap-python-runtime.sh",
+        file=sys.stderr,
+    )
     sys.exit(1)
 print(os.path.join(os.path.dirname(torch.__file__), "lib"))
 PY

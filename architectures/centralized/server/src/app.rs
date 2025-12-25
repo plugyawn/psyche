@@ -17,7 +17,7 @@ use psyche_network::{ClientNotification, TcpServer};
 use psyche_tui::{
     CustomWidget, MaybeTui, TabbedWidget, logging::LoggerWidget, maybe_start_render_loop,
 };
-use psyche_watcher::{CoordinatorTui, OpportunisticData};
+use psyche_watcher::{CoordinatorTui, ModelSchemaInfo, OpportunisticData};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -103,6 +103,8 @@ pub struct App {
     original_warmup_time: u64,
     withdraw_on_disconnect: bool,
     pause: Option<Arc<Notify>>,
+    expected_schema: Option<ModelSchemaInfo>,
+    client_schemas: HashMap<ClientId, ModelSchemaInfo>,
 }
 
 /// Methods intended for testing purposes only.
@@ -289,6 +291,8 @@ impl App {
                 original_warmup_time,
                 withdraw_on_disconnect,
                 pause,
+                expected_schema: None,
+                client_schemas: HashMap::new(),
             })
         }.instrument(info_span!("App::new")).await
     }
@@ -355,6 +359,7 @@ impl App {
     fn on_disconnect(&mut self, from: ClientId) -> Result<()> {
         self.backend.pending_clients.remove(&from);
         self.backend.client_capabilities.remove(&from);
+        self.client_schemas.remove(&from);
 
         if self.withdraw_on_disconnect {
             let position = self
@@ -406,6 +411,51 @@ impl App {
                 } else {
                     info!("{from:?} tried to join unknown run {run_id}");
                 }
+                false
+            }
+            ClientToServerMessage::Schema { schema } => {
+                let expected = self
+                    .expected_schema
+                    .as_ref()
+                    .map(|s| s.schema_hash_canonical);
+
+                match expected {
+                    None => {
+                        info!(
+                            client_id = %from,
+                            matformer_tier = schema.matformer_tier,
+                            uses_sliced_checkpoint = schema.uses_sliced_checkpoint,
+                            parameter_count = schema.parameter_count,
+                            schema_hash_canonical = ?schema.schema_hash_canonical,
+                            "schema_hash_set"
+                        );
+                        self.expected_schema = Some(schema.clone());
+                    }
+                    Some(expected_hash) if expected_hash != schema.schema_hash_canonical => {
+                        warn!(
+                            client_id = %from,
+                            expected = ?expected_hash,
+                            got = ?schema.schema_hash_canonical,
+                            "schema_hash_mismatch; ignoring client"
+                        );
+                        self.backend.pending_clients.remove(&from);
+                        self.backend.client_capabilities.remove(&from);
+                        self.client_schemas.remove(&from);
+                        return;
+                    }
+                    Some(_) => {
+                        info!(
+                            client_id = %from,
+                            matformer_tier = schema.matformer_tier,
+                            uses_sliced_checkpoint = schema.uses_sliced_checkpoint,
+                            parameter_count = schema.parameter_count,
+                            schema_hash_canonical = ?schema.schema_hash_canonical,
+                            "schema_hash_match"
+                        );
+                    }
+                }
+
+                self.client_schemas.insert(from, schema);
                 false
             }
             ClientToServerMessage::Witness(witness) => {

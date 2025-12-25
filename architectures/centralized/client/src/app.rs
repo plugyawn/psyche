@@ -15,7 +15,7 @@ use psyche_network::{
 };
 use psyche_tui::logging::LoggerWidget;
 use psyche_tui::{CustomWidget, TabbedWidget};
-use psyche_watcher::{Backend as WatcherBackend, CoordinatorTui, OpportunisticData};
+use psyche_watcher::{Backend as WatcherBackend, CoordinatorTui, ModelSchemaInfo, OpportunisticData};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -32,6 +32,7 @@ pub enum ToSend {
     Witness(Box<OpportunisticData>),
     HealthCheck(HealthChecks<ClientId>),
     Checkpoint(model::HubRepo),
+    Schema(ModelSchemaInfo),
 }
 
 struct Backend {
@@ -71,6 +72,11 @@ impl WatcherBackend<ClientId> for Backend {
 
     async fn send_checkpoint(&mut self, checkpoint: model::HubRepo) -> Result<()> {
         self.tx.send(ToSend::Checkpoint(checkpoint))?;
+        Ok(())
+    }
+
+    async fn send_schema(&mut self, schema: ModelSchemaInfo) -> Result<()> {
+        self.tx.send(ToSend::Schema(schema))?;
         Ok(())
     }
 }
@@ -244,6 +250,7 @@ impl App {
                         ToSend::Witness(witness) => self.server_conn.send(ClientToServerMessage::Witness(witness)).await?,
                         ToSend::HealthCheck(health_checks) => self.server_conn.send(ClientToServerMessage::HealthCheck(health_checks)).await?,
                         ToSend::Checkpoint(checkpoint) => self.server_conn.send(ClientToServerMessage::Checkpoint(checkpoint)).await?,
+                        ToSend::Schema(schema) => self.server_conn.send(ClientToServerMessage::Schema { schema }).await?,
                     };
                 }
             }

@@ -5,7 +5,7 @@ use psyche_core::NodeIdentity;
 use psyche_network::{
     AuthenticatableIdentity, EndpointId, FromSignedBytesError, PublicKey, SecretKey, SignedMessage,
 };
-use psyche_watcher::OpportunisticData;
+use psyche_watcher::{ModelSchemaInfo, OpportunisticData};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use ts_rs::TS;
@@ -30,6 +30,7 @@ pub enum ClientToServerMessage {
         run_id: String,
         capabilities: ClientCapabilities,
     },
+    Schema { schema: ModelSchemaInfo },
     Witness(Box<OpportunisticData>),
     HealthCheck(HealthChecks<ClientId>),
     Checkpoint(model::HubRepo),

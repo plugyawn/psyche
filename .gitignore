@@ -36,6 +36,7 @@ perf.data.*
 .zed/
 .idea/
 .venv/
+.uv-cache/
 .cargo-home/
 .cargo-target/
 .cargo-target-tests/
@@ -51,6 +52,7 @@ bindings
 ### Data folders ###
 /data
 /distro-data
+/papers
 checkpoints/
 logs/
 dist/
@@ -65,6 +67,9 @@ test-ledger
 
 ### Book ###
 book
+
+### External repos ###
+modded-nanogpt/
 
 ### Env files ###
 **/.env
