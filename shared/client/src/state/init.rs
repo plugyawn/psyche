@@ -4,10 +4,11 @@ use psyche_coordinator::{
     Coordinator, HealthChecks,
     model::{self, HttpLLMTrainingDataLocation, LLMTrainingDataLocation},
 };
-use psyche_core::{Barrier, CancellableBarrier, NodeIdentity, Shuffle, TokenSize};
+use psyche_core::{Barrier, CancellableBarrier, NodeIdentity, Shuffle, TokenSize, sha256};
 use psyche_data_provider::{
-    DataProvider, DataProviderTcpClient, DummyDataProvider, PreprocessedDataProvider, Split,
-    WeightedDataProvider, download_dataset_repo_async, download_model_repo_async,
+    DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider,
+    PreprocessedDataProvider, Split, WeightedDataProvider, download_dataset_repo_async,
+    download_model_repo_async,
     http::{FileURLs, HttpDataProvider},
 };
 use psyche_metrics::ClientMetrics;
@@ -19,7 +20,7 @@ use psyche_modeling::{
     auto_tokenizer,
 };
 use psyche_network::{AuthenticatableIdentity, BlobTicket};
-use psyche_watcher::OpportunisticData;
+use psyche_watcher::{ModelSchemaInfo, OpportunisticData};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -33,7 +34,7 @@ use tokio::{
     sync::{mpsc::UnboundedSender, oneshot},
     task::{JoinError, JoinHandle},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{
     CheckpointConfig, FinishedBroadcast, cooldown::CooldownStepMetadata, evals::ModelTaskRunner,
@@ -129,6 +130,50 @@ async fn resolve_matformer_local_repo_path(
     }
 }
 
+fn schema_hash_for_config(
+    architecture: model::LLMArchitecture,
+    config: &serde_json::Value,
+    parameter_names: &[String],
+) -> [u8; 32] {
+    let arch = format!("{architecture:?}");
+    let mut names = parameter_names.to_vec();
+    names.sort();
+    let config_json =
+        serde_json::to_string(config).expect("config value is always serializable");
+    let mut data = Vec::with_capacity(arch.len() + config_json.len() + names.len() * 32);
+    data.extend_from_slice(arch.as_bytes());
+    data.push(0);
+    data.extend_from_slice(config_json.as_bytes());
+    data.push(0);
+    for name in names {
+        data.extend_from_slice(name.as_bytes());
+        data.push(0);
+    }
+    sha256(&data)
+}
+
+fn canonicalize_config_for_schema(
+    mut config: serde_json::Value,
+    matformer_tier: u8,
+    uses_sliced_checkpoint: bool,
+) -> serde_json::Value {
+    if let Some(obj) = config.as_object_mut() {
+        if uses_sliced_checkpoint && matformer_tier > 0 {
+            if let Some(value) = obj.get_mut("intermediate_size") {
+                if let Some(base) = value.as_u64() {
+                    if let Some(scaled) = base.checked_shl(matformer_tier as u32) {
+                        *value = serde_json::Value::from(scaled);
+                    }
+                }
+            }
+        }
+        if obj.contains_key("matformer_tier") {
+            obj.insert("matformer_tier".to_string(), serde_json::Value::from(0));
+        }
+    }
+    config
+}
+
 #[derive(Debug, Error)]
 pub enum InitRunError {
     #[error("No model provided in Coordinator state, nothing to do.")]
@@ -209,6 +254,7 @@ pub struct RunInitConfigAndIO<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub tx_health_check: UnboundedSender<HealthChecks<T>>,
     pub tx_witness: UnboundedSender<OpportunisticData>,
     pub tx_checkpoint: UnboundedSender<model::HubRepo>,
+    pub tx_schema: UnboundedSender<ModelSchemaInfo>,
     pub tx_model: UnboundedSender<HashMap<String, Tensor>>,
     pub tx_parameters_req: UnboundedSender<(Vec<String>, OneshotModelParameterSender)>,
     pub tx_config: UnboundedSender<(String, String)>,
@@ -240,6 +286,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             tx_witness,
             tx_health_check,
             tx_checkpoint,
+            tx_schema,
             tx_model,
             tx_config,
             tx_parameters_req,
@@ -274,7 +321,33 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     )
                     .await?,
                 ),
-                LLMTrainingDataLocation::Local(_) => todo!(),
+                LLMTrainingDataLocation::Local(url) => {
+                    let url: String = (&url).into();
+                    let dir = if std::fs::exists(&url).unwrap_or_default() {
+                        PathBuf::from(url)
+                    } else {
+                        download_dataset_repo_async(
+                            url.clone(),
+                            None,
+                            None,
+                            hub_read_token,
+                            Some(hub_max_concurrent_downloads),
+                            false,
+                        )
+                        .await?
+                        .first()
+                        .ok_or(anyhow::anyhow!("No files downloaded for {url}"))?
+                        .parent()
+                        .unwrap()
+                        .into()
+                    };
+                    DataProvider::Local(LocalDataProvider::new_from_directory(
+                        dir,
+                        TokenSize::TwoBytes,
+                        llm.max_seq_len as usize,
+                        Shuffle::DontShuffle,
+                    )?)
+                }
                 LLMTrainingDataLocation::Dummy => {
                     DataProvider::Dummy(DummyDataProvider::new(
                         TokenSize::TwoBytes,
@@ -730,28 +803,49 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             .send((serialized_config.clone(), serialized_tokenizer))
                             .unwrap();
 
-                        let config_json: Option<serde_json::Value> =
-                            serde_json::from_str(&serialized_config).ok();
+                        let config_json: serde_json::Value =
+                            serde_json::from_str(&serialized_config)?;
                         let hidden_size = config_json
-                            .as_ref()
-                            .and_then(|v| v.get("hidden_size"))
+                            .get("hidden_size")
                             .and_then(|v| v.as_u64());
                         let intermediate_size = config_json
-                            .as_ref()
-                            .and_then(|v| v.get("intermediate_size"))
+                            .get("intermediate_size")
                             .and_then(|v| v.as_u64());
                         let active_intermediate_size = intermediate_size.and_then(|h| {
                             let divisor = 1_u64.checked_shl(matformer_tier_for_loading as u32)?;
                             Some(h / divisor)
                         });
                         let num_hidden_layers = config_json
-                            .as_ref()
-                            .and_then(|v| v.get("num_hidden_layers"))
+                            .get("num_hidden_layers")
                             .and_then(|v| v.as_u64());
                         let vocab_size = config_json
-                            .as_ref()
-                            .and_then(|v| v.get("vocab_size"))
+                            .get("vocab_size")
                             .and_then(|v| v.as_u64());
+
+                        let canonical_config = canonicalize_config_for_schema(
+                            config_json.clone(),
+                            init_config.matformer_tier,
+                            uses_sliced_checkpoint,
+                        );
+                        let schema_info = ModelSchemaInfo {
+                            schema_hash_local: schema_hash_for_config(
+                                llm.architecture,
+                                &config_json,
+                                &parameter_names,
+                            ),
+                            schema_hash_canonical: schema_hash_for_config(
+                                llm.architecture,
+                                &canonical_config,
+                                &parameter_names,
+                            ),
+                            parameter_count: u32::try_from(parameter_names.len())
+                                .unwrap_or(u32::MAX),
+                            matformer_tier: init_config.matformer_tier,
+                            uses_sliced_checkpoint,
+                        };
+                        if tx_schema.send(schema_info).is_err() {
+                            warn!("Failed to send schema hash info; channel closed");
+                        }
 
                         match (hidden_size, intermediate_size, active_intermediate_size) {
                             (Some(hidden_size), Some(intermediate_size), Some(active_intermediate_size)) => {

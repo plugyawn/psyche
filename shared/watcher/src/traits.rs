@@ -10,6 +10,15 @@ pub enum OpportunisticData {
     WarmupStep(Witness),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSchemaInfo {
+    pub schema_hash_local: [u8; 32],
+    pub schema_hash_canonical: [u8; 32],
+    pub parameter_count: u32,
+    pub matformer_tier: u8,
+    pub uses_sliced_checkpoint: bool,
+}
+
 impl OpportunisticData {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -28,4 +37,7 @@ pub trait Backend<T: NodeIdentity>: Send + Sync {
     async fn send_witness(&mut self, opportunistic_data: OpportunisticData) -> Result<()>;
     async fn send_health_check(&mut self, health_check: HealthChecks<T>) -> Result<()>;
     async fn send_checkpoint(&mut self, checkpoint: model::HubRepo) -> Result<()>;
+    async fn send_schema(&mut self, _schema: ModelSchemaInfo) -> Result<()> {
+        Ok(())
+    }
 }
