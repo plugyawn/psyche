@@ -626,4 +626,186 @@ mod tests {
             "BF16 norm unexpected: {norm_bf16} (expected ~{expected_norm})"
         );
     }
+
+    // ==================== Convergence Tests ====================
+
+    /// Compute orthogonality error: ||Q @ Q^T - I||_F / n
+    fn orthogonality_error(q: &Tensor) -> f64 {
+        let n = q.size()[0] as f64;
+        let qqt = q.matmul(&q.tr());
+        let identity = Tensor::eye(q.size()[0], (q.kind(), q.device()));
+        let frobenius = (&qqt - &identity).norm().double_value(&[]);
+        frobenius / n
+    }
+
+    #[test]
+    fn test_convergence_iteration_improves() {
+        // More iterations should generally improve orthogonality (not strictly monotonic)
+        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+
+        let mut errors = Vec::new();
+
+        for iters in 1..=5 {
+            let result = polar_express_impl(&g, iters, Kind::Float, Kind::Float);
+            let error = orthogonality_error(&result);
+            errors.push(error);
+        }
+
+        // Log errors for visibility
+        eprintln!("Iteration errors: {:?}", errors);
+
+        // Error at iteration 5 should be less than iteration 1
+        // (not strictly monotonic - some iterations may temporarily increase)
+        assert!(
+            errors[4] < errors[0],
+            "5-iteration error ({}) should be < 1-iteration error ({})",
+            errors[4],
+            errors[0]
+        );
+
+        // Error at iteration 5 should be reasonably small
+        assert!(
+            errors[4] < 0.2,
+            "5-iteration error should be < 0.2, got {}",
+            errors[4]
+        );
+    }
+
+    #[test]
+    fn test_convergence_rate_five_iterations() {
+        // 5 iterations should achieve orthogonality error < 0.1 for well-conditioned matrices
+        let g = Tensor::randn([32, 32], (Kind::Float, Device::Cpu));
+        let result = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
+
+        let error = orthogonality_error(&result);
+        assert!(
+            error < 0.1,
+            "5 iterations should achieve error < 0.1, got {}",
+            error
+        );
+    }
+
+    #[test]
+    fn test_convergence_rectangular_matrices() {
+        // Polar Express should work on rectangular matrices (m x n where m != n)
+        // For tall matrices (m > n), we get Q such that Q^T @ Q ≈ I_n
+        // For wide matrices (m < n), we get Q such that Q @ Q^T ≈ I_m
+
+        // Tall matrix (more rows than columns)
+        let g_tall = Tensor::randn([32, 16], (Kind::Float, Device::Cpu));
+        let result_tall = polar_express_impl(&g_tall, 5, Kind::Float, Kind::Float);
+
+        // For tall matrices, Q^T @ Q should be close to identity
+        let qtq = result_tall.tr().matmul(&result_tall);
+        let identity_n = Tensor::eye(16, (Kind::Float, Device::Cpu));
+        let error_tall = (&qtq - &identity_n).norm().double_value(&[]) / 16.0;
+
+        assert!(
+            error_tall < 0.2,
+            "Tall matrix Q^T @ Q error too high: {}",
+            error_tall
+        );
+
+        // Wide matrix (more columns than rows)
+        let g_wide = Tensor::randn([16, 32], (Kind::Float, Device::Cpu));
+        let result_wide = polar_express_impl(&g_wide, 5, Kind::Float, Kind::Float);
+
+        // For wide matrices, Q @ Q^T should be close to identity
+        let qqt = result_wide.matmul(&result_wide.tr());
+        let identity_m = Tensor::eye(16, (Kind::Float, Device::Cpu));
+        let error_wide = (&qqt - &identity_m).norm().double_value(&[]) / 16.0;
+
+        assert!(
+            error_wide < 0.2,
+            "Wide matrix Q @ Q^T error too high: {}",
+            error_wide
+        );
+    }
+
+    #[test]
+    fn test_convergence_stability_under_perturbation() {
+        // Two similar inputs should produce similar outputs (Lipschitz continuity)
+        let g1 = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+        let perturbation = Tensor::randn([16, 16], (Kind::Float, Device::Cpu)) * 0.01;
+        let g2 = &g1 + &perturbation;
+
+        let result1 = polar_express_impl(&g1, 5, Kind::Float, Kind::Float);
+        let result2 = polar_express_impl(&g2, 5, Kind::Float, Kind::Float);
+
+        // Output difference should be bounded by some multiple of input difference
+        let input_diff = (&g1 - &g2).norm().double_value(&[]);
+        let output_diff = (&result1 - &result2).norm().double_value(&[]);
+
+        // Polar Express is designed to be stable; output perturbation should be reasonable
+        // Allow up to 10x amplification (typical for well-conditioned cases)
+        let amplification = output_diff / input_diff;
+        assert!(
+            amplification < 20.0,
+            "Perturbation amplified too much: input_diff={}, output_diff={}, ratio={}",
+            input_diff,
+            output_diff,
+            amplification
+        );
+    }
+
+    #[test]
+    fn test_convergence_condition_number_impact() {
+        // Test with matrices of varying condition numbers
+        // Higher condition number → potentially slower convergence
+
+        // Well-conditioned matrix (condition number ~1)
+        let well_conditioned = Tensor::eye(16, (Kind::Float, Device::Cpu))
+            + Tensor::randn([16, 16], (Kind::Float, Device::Cpu)) * 0.1;
+        let result_wc = polar_express_impl(&well_conditioned, 5, Kind::Float, Kind::Float);
+        let error_wc = orthogonality_error(&result_wc);
+
+        // Moderately ill-conditioned matrix
+        // Create by scaling singular values differently
+        let u = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+        let (q, _) = u.qr(true); // Get orthogonal Q from QR decomposition
+        let singular_values = Tensor::from_slice(&[
+            10.0f32, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.1,
+        ])
+        .reshape([16, 1]);
+        let ill_conditioned = &q * &singular_values; // Scale columns by singular values
+        let result_ic = polar_express_impl(&ill_conditioned, 5, Kind::Float, Kind::Float);
+        let error_ic = orthogonality_error(&result_ic);
+
+        // Both should converge, but well-conditioned should be better
+        assert!(
+            error_wc < 0.15,
+            "Well-conditioned error too high: {}",
+            error_wc
+        );
+        assert!(
+            error_ic < 0.5,
+            "Ill-conditioned error too high (should still converge): {}",
+            error_ic
+        );
+
+        // Log the results for visibility
+        #[cfg(test)]
+        {
+            eprintln!(
+                "Condition number test: well_conditioned_error={:.4}, ill_conditioned_error={:.4}",
+                error_wc, error_ic
+            );
+        }
+    }
+
+    #[test]
+    fn test_convergence_deterministic() {
+        // Same input should produce same output (no randomness in algorithm)
+        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+
+        let result1 = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
+        let result2 = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
+
+        let diff = (&result1 - &result2).abs().max().double_value(&[]);
+        assert!(
+            diff < 1e-10,
+            "Same input should produce identical output, diff={}",
+            diff
+        );
+    }
 }

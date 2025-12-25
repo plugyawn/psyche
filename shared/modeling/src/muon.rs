@@ -374,6 +374,9 @@ impl std::fmt::Debug for Muon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CausalLM, EosToks, StableVarStoreIterator, StableVariableIterator, Communicator};
+    use std::sync::Arc;
+    use tch::nn::{self, Module, VarStore};
 
     #[test]
     fn test_muon_config_default() {
@@ -393,5 +396,385 @@ mod tests {
         assert_eq!(muon.get_param_group("model.layers.0.input_layernorm.weight"), 1); // norm
         assert_eq!(muon.get_param_group("lm_head.weight"), 2); // lm_head
         assert_eq!(muon.get_param_group("model.layers.0.mlp.gate_proj.weight"), 4); // catch-all
+    }
+
+    // ==================== Training Convergence Test ====================
+
+    /// A tiny transformer for testing training convergence.
+    /// Architecture: embed -> 2 transformer blocks -> output projection
+    /// Each block: layernorm -> attention (simplified) -> layernorm -> MLP
+    struct TinyTransformer {
+        var_store: VarStore,
+        embed: nn::Embedding,
+        blocks: Vec<TinyBlock>,
+        ln_f: nn::LayerNorm,
+        lm_head: nn::Linear,
+        config: TinyConfig,
+    }
+
+    struct TinyConfig {
+        vocab_size: i64,
+        hidden_size: i64,
+        num_layers: usize,
+        num_heads: i64,
+        intermediate_size: i64,
+    }
+
+    impl TinyConfig {
+        fn tiny() -> Self {
+            Self {
+                vocab_size: 256,
+                hidden_size: 64,
+                num_layers: 2,
+                num_heads: 4,
+                intermediate_size: 128,
+            }
+        }
+    }
+
+    struct TinyBlock {
+        ln1: nn::LayerNorm,
+        attn_qkv: nn::Linear,
+        attn_out: nn::Linear,
+        ln2: nn::LayerNorm,
+        mlp_up: nn::Linear,
+        mlp_down: nn::Linear,
+        num_heads: i64,
+        head_dim: i64,
+    }
+
+    impl TinyBlock {
+        fn new(vs: &nn::Path, hidden_size: i64, num_heads: i64, intermediate_size: i64) -> Self {
+            let head_dim = hidden_size / num_heads;
+            let ln_config = nn::LayerNormConfig::default();
+
+            Self {
+                ln1: nn::layer_norm(vs / "ln1", vec![hidden_size], ln_config),
+                attn_qkv: nn::linear(vs / "attn_qkv", hidden_size, 3 * hidden_size, Default::default()),
+                attn_out: nn::linear(vs / "attn_out", hidden_size, hidden_size, Default::default()),
+                ln2: nn::layer_norm(vs / "ln2", vec![hidden_size], ln_config),
+                mlp_up: nn::linear(vs / "mlp_up", hidden_size, intermediate_size, Default::default()),
+                mlp_down: nn::linear(vs / "mlp_down", intermediate_size, hidden_size, Default::default()),
+                num_heads,
+                head_dim,
+            }
+        }
+
+        fn forward(&self, x: &Tensor) -> Tensor {
+            let (batch, seq_len, hidden) = (x.size()[0], x.size()[1], x.size()[2]);
+
+            // Self-attention with residual
+            let h = self.ln1.forward(x);
+            let qkv = self.attn_qkv.forward(&h);
+            let qkv = qkv.reshape([batch, seq_len, 3, self.num_heads, self.head_dim]);
+            let qkv = qkv.permute([2, 0, 3, 1, 4]); // [3, B, H, S, D]
+            let q = qkv.select(0, 0);
+            let k = qkv.select(0, 1);
+            let v = qkv.select(0, 2);
+
+            // Scaled dot-product attention (causal)
+            let scale = (self.head_dim as f64).sqrt();
+            let attn = q.matmul(&k.transpose(-2, -1)) / scale;
+
+            // Causal mask
+            let mask = Tensor::ones([seq_len, seq_len], (Kind::Float, x.device()))
+                .tril(0)
+                .reshape([1, 1, seq_len, seq_len]);
+            let attn = attn.masked_fill(&mask.eq(0.0), f64::NEG_INFINITY);
+            let attn = attn.softmax(-1, Kind::Float);
+
+            let out = attn.matmul(&v); // [B, H, S, D]
+            let out = out.permute([0, 2, 1, 3]).reshape([batch, seq_len, hidden]);
+            let out = self.attn_out.forward(&out);
+            let x = x + out;
+
+            // MLP with residual
+            let h = self.ln2.forward(&x);
+            let h = self.mlp_up.forward(&h).gelu("none");
+            let h = self.mlp_down.forward(&h);
+            x + h
+        }
+    }
+
+    impl TinyTransformer {
+        fn new(config: TinyConfig, device: tch::Device) -> Self {
+            let var_store = VarStore::new(device);
+            let vs = var_store.root();
+
+            // Use path separators that tch-rs allows (no dots in names)
+            let model_path = &vs / "model";
+            let embed = nn::embedding(
+                &model_path / "embed_tokens",
+                config.vocab_size,
+                config.hidden_size,
+                Default::default(),
+            );
+
+            let mut blocks = Vec::new();
+            let layers_path = &model_path / "layers";
+            for i in 0..config.num_layers {
+                let layer_path = &layers_path / i;
+                blocks.push(TinyBlock::new(
+                    &layer_path,
+                    config.hidden_size,
+                    config.num_heads,
+                    config.intermediate_size,
+                ));
+            }
+
+            let ln_config = nn::LayerNormConfig::default();
+            let ln_f = nn::layer_norm(&model_path / "norm", vec![config.hidden_size], ln_config);
+            let lm_head = nn::linear(&vs / "lm_head", config.hidden_size, config.vocab_size, Default::default());
+
+            Self {
+                var_store,
+                embed,
+                blocks,
+                ln_f,
+                lm_head,
+                config,
+            }
+        }
+    }
+
+    impl CausalLM for TinyTransformer {
+        fn forward(
+            &self,
+            x: &Tensor,
+            labels: Option<&Tensor>,
+            _position_ids: Option<&Tensor>,
+            _sequence_lengths: Option<&Vec<Vec<i32>>>,
+            _num_logits_to_keep: Option<i64>,
+            loss_scale: Option<f64>,
+        ) -> (Option<Tensor>, Option<Tensor>) {
+            // x: [batch, seq_len] of token ids
+            let mut h = self.embed.forward(x); // [batch, seq_len, hidden]
+
+            for block in &self.blocks {
+                h = block.forward(&h);
+            }
+
+            h = self.ln_f.forward(&h);
+            let logits = self.lm_head.forward(&h); // [batch, seq_len, vocab]
+
+            let loss = labels.map(|labels| {
+                // Shift logits and labels for next-token prediction
+                let shift_logits = logits.narrow(1, 0, logits.size()[1] - 1);
+                let shift_labels = labels.narrow(1, 1, labels.size()[1] - 1);
+
+                let batch_seq = shift_logits.size()[0] * shift_logits.size()[1];
+                let flat_logits = shift_logits.reshape([batch_seq, self.config.vocab_size]);
+                let flat_labels = shift_labels.reshape([batch_seq]);
+
+                let loss = flat_logits.cross_entropy_for_logits(&flat_labels);
+                match loss_scale {
+                    Some(scale) => loss / scale,
+                    None => loss,
+                }
+            });
+
+            (Some(logits), loss)
+        }
+
+        fn bos_token_id(&self) -> Option<i64> {
+            Some(1)
+        }
+
+        fn eos_token_ids(&self) -> Option<EosToks> {
+            Some(EosToks::Single(2))
+        }
+
+        fn device(&self) -> tch::Device {
+            self.var_store.device()
+        }
+
+        fn max_context_length(&self) -> usize {
+            512
+        }
+
+        fn variables(&self) -> StableVariableIterator {
+            Box::new(StableVarStoreIterator::new(&self.var_store, None))
+        }
+
+        fn communicator(&self) -> Option<Arc<Communicator>> {
+            None
+        }
+
+        fn prepare_for_training(&self) {
+            for var in self.variables() {
+                let _ = var.local_tensor().set_requires_grad(true);
+            }
+        }
+
+        fn clip_grad_norm(&self, max_grad_norm: f64) {
+            let _guard = tch::no_grad_guard();
+            let mut total_norm_sq = 0.0f64;
+
+            for var in self.variables() {
+                let grad = var.local_tensor().grad();
+                if grad.defined() {
+                    let norm_sq: f64 = grad.square().sum(Kind::Float).double_value(&[]);
+                    total_norm_sq += norm_sq;
+                }
+            }
+
+            let total_norm = total_norm_sq.sqrt();
+            if total_norm > max_grad_norm {
+                let clip_coef = max_grad_norm / (total_norm + 1e-6);
+                for var in self.variables() {
+                    let mut grad = var.local_tensor().grad();
+                    if grad.defined() {
+                        let _ = grad.g_mul_scalar_(clip_coef);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_muon_training_convergence() {
+        // Test that Muon optimizer reduces loss over training steps
+        let device = tch::Device::Cpu;
+        let model = TinyTransformer::new(TinyConfig::tiny(), device);
+        model.prepare_for_training();
+
+        let mut optimizer = Muon::new(MuonConfig::default().with_lr(1e-3));
+
+        // Generate synthetic training data (random tokens)
+        let batch_size = 4;
+        let seq_len = 32;
+        let data = Tensor::randint(256, [batch_size, seq_len], (Kind::Int64, device));
+
+        // Training loop
+        let num_steps = 50;
+        let mut losses = Vec::new();
+
+        for step in 0..num_steps {
+            optimizer.zero_grad(&model);
+
+            // Forward pass with labels = input (next token prediction)
+            let (_, loss) = model.forward(&data, Some(&data), None, None, None, None);
+            let loss = loss.unwrap();
+
+            // Record loss
+            let loss_val = loss.double_value(&[]);
+            losses.push(loss_val);
+
+            // Backward pass
+            loss.backward();
+
+            // Optimizer step
+            optimizer.step(&model, 1e-3);
+
+            if step % 10 == 0 {
+                eprintln!("Step {}: loss = {:.4}", step, loss_val);
+            }
+        }
+
+        // Verify convergence: loss should decrease
+        let initial_loss = losses[0];
+        let final_loss = losses[num_steps - 1];
+
+        assert!(
+            final_loss < initial_loss,
+            "Loss should decrease: initial={:.4}, final={:.4}",
+            initial_loss,
+            final_loss
+        );
+
+        // Loss should decrease by at least 20%
+        let improvement = (initial_loss - final_loss) / initial_loss;
+        assert!(
+            improvement > 0.2,
+            "Loss should improve by >20%: initial={:.4}, final={:.4}, improvement={:.1}%",
+            initial_loss,
+            final_loss,
+            improvement * 100.0
+        );
+
+        // No NaN losses
+        for (i, &loss) in losses.iter().enumerate() {
+            assert!(
+                loss.is_finite(),
+                "Loss became non-finite at step {}: {}",
+                i,
+                loss
+            );
+        }
+
+        eprintln!(
+            "Training convergence test passed: {:.4} -> {:.4} ({:.1}% improvement)",
+            initial_loss,
+            final_loss,
+            improvement * 100.0
+        );
+    }
+
+    #[test]
+    fn test_muon_vs_adamw_comparison() {
+        // Compare Muon with orthogonalization vs pure AdamW
+        // Both should converge, but we verify Muon doesn't break anything
+        let device = tch::Device::Cpu;
+
+        // Same seed for fair comparison
+        tch::manual_seed(42);
+        let data = Tensor::randint(256, [4, 32], (Kind::Int64, device));
+
+        // Train with Muon
+        tch::manual_seed(42);
+        let model_muon = TinyTransformer::new(TinyConfig::tiny(), device);
+        model_muon.prepare_for_training();
+        let mut optimizer_muon = Muon::new(MuonConfig::default().with_lr(1e-3));
+
+        let mut losses_muon = Vec::new();
+        for _ in 0..30 {
+            optimizer_muon.zero_grad(&model_muon);
+            let (_, loss) = model_muon.forward(&data, Some(&data), None, None, None, None);
+            let loss = loss.unwrap();
+            losses_muon.push(loss.double_value(&[]));
+            loss.backward();
+            optimizer_muon.step(&model_muon, 1e-3);
+        }
+
+        // Train with AdamW-only config (no orthogonalization)
+        tch::manual_seed(42);
+        let model_adamw = TinyTransformer::new(TinyConfig::tiny(), device);
+        model_adamw.prepare_for_training();
+        let adamw_config = MuonConfig {
+            param_groups: vec![MuonParamGroupConfig::adamw(".*")], // All AdamW
+            ..MuonConfig::default()
+        };
+        let mut optimizer_adamw = Muon::new(adamw_config.with_lr(1e-3));
+
+        let mut losses_adamw = Vec::new();
+        for _ in 0..30 {
+            optimizer_adamw.zero_grad(&model_adamw);
+            let (_, loss) = model_adamw.forward(&data, Some(&data), None, None, None, None);
+            let loss = loss.unwrap();
+            losses_adamw.push(loss.double_value(&[]));
+            loss.backward();
+            optimizer_adamw.step(&model_adamw, 1e-3);
+        }
+
+        // Both should converge
+        let muon_improvement = (losses_muon[0] - losses_muon[29]) / losses_muon[0];
+        let adamw_improvement = (losses_adamw[0] - losses_adamw[29]) / losses_adamw[0];
+
+        assert!(
+            muon_improvement > 0.1,
+            "Muon should improve: {:.1}%",
+            muon_improvement * 100.0
+        );
+        assert!(
+            adamw_improvement > 0.1,
+            "AdamW should improve: {:.1}%",
+            adamw_improvement * 100.0
+        );
+
+        eprintln!(
+            "Muon improvement: {:.1}%, AdamW improvement: {:.1}%",
+            muon_improvement * 100.0,
+            adamw_improvement * 100.0
+        );
     }
 }
