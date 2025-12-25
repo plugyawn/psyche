@@ -8,7 +8,10 @@ mod device_utils;
 mod distro;
 mod dummy;
 mod fp32_gradient_accumulator;
+pub mod kernels;
+pub mod metrics;
 mod models;
+pub mod muon;
 mod optimizer;
 mod parallelism;
 #[cfg(feature = "python")]
