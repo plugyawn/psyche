@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use psyche_core::{
-    Barrier, BatchId, CancellableBarrier, ClosedInterval, CosineLR, OptimizerDefinition, Shuffle,
+    Barrier, BatchId, CancellableBarrier, ClosedInterval, CosineLR, LearningRateScheduler,
+    OptimizerDefinition, Shuffle,
 };
 use psyche_data_provider::{
     DataProvider, LengthKnownDataProvider, LocalDataProvider, PreprocessedDataProvider, Split,
@@ -11,10 +12,11 @@ use psyche_modeling::{
     AttentionImplementation, Batch, BatchData, BatchDataCPU, CausalLM, CommunicatorId,
     DataParallel, Devices, LocalTrainer, ModelLoadError, ParallelModels, Trainer,
     auto_model_for_causal_lm_from_pretrained,
+    metrics::{MetricsConfig, MetricsRecorder, StepMetrics},
 };
 use psyche_network::AuthenticatableIdentity;
 use psyche_tui::{logging, setup_ctrl_c};
-use std::{sync::Arc, thread::JoinHandle, time::SystemTime};
+use std::{path::PathBuf, sync::Arc, thread::JoinHandle, time::SystemTime};
 use tch::Kind;
 use tracing::info;
 
@@ -163,6 +165,14 @@ struct Args {
 
     #[arg(long)]
     seed: Option<u32>,
+
+    /// Path to write training metrics (JSONL format)
+    #[arg(long)]
+    metrics_output: Option<PathBuf>,
+
+    /// Record detailed per-layer norms in metrics
+    #[arg(long, default_value_t = false)]
+    detailed_metrics: bool,
 }
 
 #[tokio::main]
@@ -450,6 +460,20 @@ async fn main() -> Result<()> {
 
     info!("Done loading, starting training.");
 
+    // Initialize metrics recorder
+    let mut metrics_recorder = match &args.metrics_output {
+        Some(path) => {
+            let config = MetricsConfig::enabled(path.clone());
+            let config = if args.detailed_metrics {
+                config.with_detailed_norms()
+            } else {
+                config
+            };
+            MetricsRecorder::new(config)?
+        }
+        None => MetricsRecorder::disabled(),
+    };
+
     let mut prev_distro_results = if args.distro { Some(vec![]) } else { None };
     for step in args.start_step..=args.total_steps {
         let start_time = SystemTime::now();
@@ -522,6 +546,7 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>();
 
         let mut loss = 0.;
+        let mut grad_norm = 0.0f32;
         let joined_trainers = trainings
             .into_iter()
             .map(|x| x.join().unwrap())
@@ -534,6 +559,7 @@ async fn main() -> Result<()> {
                 if index == 0 {
                     prev_distro_results = output.distro_results.map(|x| vec![x]);
                     loss = output.loss;
+                    grad_norm = output.grad_norm;
                 }
                 output.trainer
             })
@@ -544,9 +570,17 @@ async fn main() -> Result<()> {
             .unwrap()
             .as_secs_f32();
 
+        // Record metrics
+        let lr = schedule.get_lr(step);
+        if metrics_recorder.is_enabled() {
+            let mut metrics = StepMetrics::new(step, loss as f64, lr);
+            metrics.global_grad_norm = grad_norm as f64;
+            metrics_recorder.record(&metrics)?;
+        }
+
         info!(
-            "step: {}, duration: {:.2}, batch: {}, loss: {:.4}",
-            step, duration, batch_id, loss
+            "step: {}, duration: {:.2}, batch: {}, loss: {:.4}, grad_norm: {:.4}",
+            step, duration, batch_id, loss, grad_norm
         );
         if cancel.is_cancelled() {
             break;

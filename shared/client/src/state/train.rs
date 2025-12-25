@@ -410,6 +410,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                 distro_results,
                                 cancelled,
                                 nonce,
+                                grad_norm: _,
                             } = completed_trainer.map_err(|_| TrainError::TrainCrashed)??;
 
                             debug!(step=step, loss=loss, batch_id=%batch_id, "Got training output, DisTrO results generated");

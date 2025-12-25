@@ -236,6 +236,8 @@ pub struct TrainOutput {
     pub nonce: u32,
     pub distro_results: Option<DistroResults>,
     pub cancelled: bool,
+    /// Global gradient L2 norm (computed after DP reduction, before clipping)
+    pub grad_norm: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -280,6 +282,7 @@ enum ParallelResult {
         nonce: u32,
         cancelled: bool,
         distro_results: Option<DistroResults>,
+        grad_norm: f32,
     },
     Optimize,
     Forward {
@@ -607,6 +610,7 @@ impl LocalTrainer {
         let mut final_distro_results = None;
         let mut final_cancelled = false;
         let mut final_nonce = 0;
+        let mut final_grad_norm = 0.0f32;
         for (_, rx) in &self.models {
             match rx
                 .recv()
@@ -617,10 +621,12 @@ impl LocalTrainer {
                     distro_results,
                     cancelled,
                     nonce,
+                    grad_norm,
                 } => {
                     if final_distro_results.is_none() {
                         final_distro_results = distro_results;
                         final_nonce = nonce;
+                        final_grad_norm = grad_norm;
                     }
                     final_cancelled = cancelled;
                     final_loss += loss;
@@ -641,6 +647,7 @@ impl LocalTrainer {
             distro_results: final_distro_results,
             cancelled: final_cancelled,
             nonce: final_nonce,
+            grad_norm: final_grad_norm,
         })
     }
 
@@ -969,6 +976,24 @@ impl LocalTrainer {
                         dp_barrier.wait().unwrap(); // cannot cancel dp
                     }
 
+                    // Compute gradient L2 norm for metrics (before clipping)
+                    let grad_norm = {
+                        let _guard = tch::no_grad_guard();
+                        let mut grad_squared_sum = 0.0f64;
+                        for variable in model.variables() {
+                            let grad = variable.local_tensor().grad();
+                            if grad.defined() {
+                                let norm_sq: f64 = grad
+                                    .to_kind(Kind::Float)
+                                    .square()
+                                    .sum(Kind::Float)
+                                    .double_value(&[]);
+                                grad_squared_sum += norm_sq;
+                            }
+                        }
+                        grad_squared_sum.sqrt() as f32
+                    };
+
                     let distro_results = match cancelled {
                         false => match &mut optimizer {
                             Optimizer::Torch {
@@ -1027,6 +1052,7 @@ impl LocalTrainer {
                             distro_results,
                             cancelled,
                             nonce,
+                            grad_norm,
                         })
                         .is_err()
                     {
