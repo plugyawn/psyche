@@ -26,6 +26,7 @@
 //! - NorMuon optimizer in modded-nanogpt
 //! - "An Optimal Matrix Sign Iteration" paper
 
+use super::detect_optimal_precision;
 use tch::{Kind, Tensor};
 
 /// Pre-computed optimal coefficients for Polar Express (5 iterations)
@@ -129,36 +130,118 @@ impl Orthogonalize for CpuOrthogonalize {
             Kind::Float
         };
 
-        // Initial normalization: X_0 = G / (||G|| * safety_factor)
-        let g_norm = g.norm().double_value(&[]);
-        if g_norm < 1e-12 {
-            // Near-zero gradient, return as-is
+        polar_express_impl(g, iterations, compute_kind, original_kind)
+    }
+}
+
+/// Adaptive orthogonalization that auto-detects optimal precision per device.
+///
+/// This implementation automatically selects the best precision based on the
+/// input tensor's device:
+/// - CPU: FP32 (universal, avoids slow BF16 emulation)
+/// - V100 (Volta): FP16 (native tensor cores)
+/// - A100+ (Ampere/Hopper): BF16 (native tensor cores)
+///
+/// This enables efficient operation in heterogeneous GPU clusters where
+/// different nodes may have different GPU architectures.
+pub struct AdaptiveOrthogonalize {
+    _private: (), // Prevent construction except through new()
+}
+
+impl AdaptiveOrthogonalize {
+    /// Create a new adaptive orthogonalization kernel
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Default for AdaptiveOrthogonalize {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Orthogonalize for AdaptiveOrthogonalize {
+    fn name(&self) -> &'static str {
+        "adaptive_polar_express"
+    }
+
+    fn is_available(&self) -> bool {
+        true // Works on any device
+    }
+
+    fn polar_express(&self, g: &Tensor, iterations: usize) -> Tensor {
+        // Only orthogonalize 2D tensors
+        if g.dim() != 2 {
+            tracing::trace!(
+                "Polar Express skipped for non-2D tensor (dim={})",
+                g.dim()
+            );
             return g.shallow_clone();
         }
 
-        let mut x = g.to_kind(compute_kind) / (g_norm * NORM_SAFETY_FACTOR);
+        let _guard = tch::no_grad_guard();
+        let original_kind = g.kind();
+        let device = g.device();
 
-        // Fixed-point iteration with pre-computed optimal coefficients
-        let num_iters = iterations.min(POLAR_COEFFS.len());
-        for (a, b, c) in POLAR_COEFFS.iter().take(num_iters) {
-            // X @ X^T
-            let xxt = x.matmul(&x.tr());
+        // Auto-detect optimal precision based on device
+        let compute_kind = detect_optimal_precision(device);
 
-            // B = b * X@X^T + c * (X@X^T)@(X@X^T)
-            let b_mat = &xxt * *b + xxt.matmul(&xxt) * *c;
-
-            // X = a * X + B @ X
-            x = &x * *a + b_mat.matmul(&x);
-        }
-
-        // Convert back to original dtype
-        x.to_kind(original_kind)
+        polar_express_impl(g, iterations, compute_kind, original_kind)
     }
+}
+
+/// Core Polar Express implementation shared between CPU and Adaptive variants.
+///
+/// # Arguments
+/// * `g` - Input 2D tensor (must be 2D, caller should check)
+/// * `iterations` - Number of iterations (max 5)
+/// * `compute_kind` - Precision for internal computation (FP32, FP16, or BF16)
+/// * `original_kind` - Original tensor dtype to convert back to
+fn polar_express_impl(g: &Tensor, iterations: usize, compute_kind: Kind, original_kind: Kind) -> Tensor {
+    // Initial normalization: X_0 = G / (||G|| * safety_factor)
+    let g_norm = g.norm().double_value(&[]);
+    if g_norm < 1e-12 {
+        // Near-zero gradient, return as-is
+        return g.shallow_clone();
+    }
+
+    let mut x = g.to_kind(compute_kind) / (g_norm * NORM_SAFETY_FACTOR);
+
+    // Fixed-point iteration with pre-computed optimal coefficients
+    let num_iters = iterations.min(POLAR_COEFFS.len());
+    for (a, b, c) in POLAR_COEFFS.iter().take(num_iters) {
+        // X @ X^T
+        let xxt = x.matmul(&x.tr());
+
+        // B = b * X@X^T + c * (X@X^T)@(X@X^T)
+        let b_mat = &xxt * *b + xxt.matmul(&xxt) * *c;
+
+        // X = a * X + B @ X
+        x = &x * *a + b_mat.matmul(&x);
+    }
+
+    // Assert numerical stability in debug mode
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            x.isnan().any().int64_value(&[]) == 0,
+            "Polar Express produced NaN"
+        );
+        assert!(
+            x.isinf().any().int64_value(&[]) == 0,
+            "Polar Express produced Inf"
+        );
+    }
+
+    // Convert back to original dtype
+    x.to_kind(original_kind)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tch::Device;
 
     #[test]
     fn test_polar_express_identity() {
@@ -295,5 +378,252 @@ mod tests {
         let matmul_ms = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
         println!("1024x1024 matmul: {:.1}ms", matmul_ms);
         println!("Polar Express has ~15 matmuls, expected: {:.1}ms", matmul_ms * 15.0);
+    }
+
+    // ==================== AdaptiveOrthogonalize tests ====================
+
+    #[test]
+    fn test_adaptive_orthogonalize_cpu() {
+        // Test that AdaptiveOrthogonalize works on CPU
+        let ortho = AdaptiveOrthogonalize::new();
+        assert_eq!(ortho.name(), "adaptive_polar_express");
+
+        let g = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let result = ortho.polar_express(&g, 5);
+
+        // Check orthogonality
+        let qqt = result.matmul(&result.tr());
+        let identity = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        let ortho_error = (&qqt - &identity).abs().max().double_value(&[]);
+
+        assert!(
+            ortho_error < 0.5,
+            "Adaptive result not orthogonal enough: max error={ortho_error}"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_orthogonalize_no_nan_inf() {
+        let ortho = AdaptiveOrthogonalize::new();
+
+        // Test with various input scales
+        for scale in [1e-6, 1.0, 1e6] {
+            let g = Tensor::randn([8, 8], (Kind::Float, Device::Cpu)) * scale;
+            let result = ortho.polar_express(&g, 5);
+
+            assert!(
+                result.isnan().any().int64_value(&[]) == 0,
+                "Result contains NaN for scale={scale}"
+            );
+            assert!(
+                result.isinf().any().int64_value(&[]) == 0,
+                "Result contains Inf for scale={scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_vs_cpu_consistency() {
+        // Adaptive on CPU should produce same results as CpuOrthogonalize
+        let adaptive = AdaptiveOrthogonalize::new();
+        let cpu = CpuOrthogonalize::new();
+
+        let g = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+
+        let result_adaptive = adaptive.polar_express(&g, 5);
+        let result_cpu = cpu.polar_express(&g, 5);
+
+        // Results should be identical on CPU (both use FP32)
+        let diff = (&result_adaptive - &result_cpu).abs().max().double_value(&[]);
+        assert!(
+            diff < 1e-5,
+            "Adaptive and CPU results differ: max diff={diff}"
+        );
+    }
+
+    #[test]
+    #[ignore] // Requires CUDA hardware
+    fn test_adaptive_orthogonalize_cuda() {
+        if !tch::Cuda::is_available() {
+            println!("CUDA not available, skipping test");
+            return;
+        }
+
+        let ortho = AdaptiveOrthogonalize::new();
+        let device = Device::Cuda(0);
+
+        let g = Tensor::randn([64, 64], (Kind::Float, device));
+        let result = ortho.polar_express(&g, 5);
+
+        // Check result is on same device
+        assert_eq!(result.device(), device);
+
+        // Check orthogonality
+        let qqt = result.to_kind(Kind::Float).matmul(&result.to_kind(Kind::Float).tr());
+        let identity = Tensor::eye(64, (Kind::Float, device));
+        let ortho_error = (&qqt - &identity).abs().max().double_value(&[]);
+
+        assert!(
+            ortho_error < 0.5,
+            "CUDA result not orthogonal enough: max error={ortho_error}"
+        );
+    }
+
+    /// Helper to check orthogonality with configurable tolerance
+    fn assert_orthogonal(q: &Tensor, tolerance: f64, msg: &str) {
+        let n = q.size()[0];
+        let qqt = q.to_kind(Kind::Float).matmul(&q.to_kind(Kind::Float).tr());
+        let identity = Tensor::eye(n, (Kind::Float, q.device()));
+        let error = (&qqt - &identity).abs().max().double_value(&[]);
+        assert!(error < tolerance, "{}: orthogonality error={}", msg, error);
+    }
+
+    #[test]
+    fn test_orthogonality_helper() {
+        // Test the helper function itself
+        let angle = std::f64::consts::PI / 4.0;
+        let data: [f32; 4] = [
+            angle.cos() as f32,
+            -angle.sin() as f32,
+            angle.sin() as f32,
+            angle.cos() as f32,
+        ];
+        let q = Tensor::from_slice(&data).reshape([2, 2]);
+
+        // This should pass - it's a rotation matrix (orthogonal)
+        assert_orthogonal(&q, 1e-5, "Rotation matrix");
+    }
+
+    // ==================== Per-Precision Orthogonality Tests ====================
+
+    #[test]
+    fn test_orthogonality_fp32() {
+        // Test orthogonality with FP32 computation
+        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+        let result = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
+
+        // Allow 0.3 tolerance (matches existing tests, random matrices have variance)
+        assert_orthogonal(&result, 0.3, "FP32 orthogonality");
+
+        // Also check no NaN/Inf
+        assert!(
+            result.isnan().any().int64_value(&[]) == 0,
+            "FP32 result contains NaN"
+        );
+        assert!(
+            result.isinf().any().int64_value(&[]) == 0,
+            "FP32 result contains Inf"
+        );
+    }
+
+    #[test]
+    fn test_orthogonality_fp16() {
+        // Test orthogonality with FP16 computation (used on V100)
+        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+        let result = polar_express_impl(&g, 5, Kind::Half, Kind::Float);
+
+        // FP16 has less precision, allow 0.35 tolerance
+        assert_orthogonal(&result, 0.35, "FP16 orthogonality");
+
+        assert!(
+            result.isnan().any().int64_value(&[]) == 0,
+            "FP16 result contains NaN"
+        );
+        assert!(
+            result.isinf().any().int64_value(&[]) == 0,
+            "FP16 result contains Inf"
+        );
+    }
+
+    #[test]
+    fn test_orthogonality_bf16() {
+        // Test orthogonality with BF16 computation (used on A100+)
+        // Note: BF16 is slow on CPU (emulated) but we test correctness
+        let g = Tensor::randn([8, 8], (Kind::Float, Device::Cpu)); // Smaller for speed
+
+        let result = polar_express_impl(&g, 5, Kind::BFloat16, Kind::Float);
+
+        // BF16 has same mantissa as FP16, so similar tolerance
+        assert_orthogonal(&result, 0.35, "BF16 orthogonality");
+
+        assert!(
+            result.isnan().any().int64_value(&[]) == 0,
+            "BF16 result contains NaN"
+        );
+        assert!(
+            result.isinf().any().int64_value(&[]) == 0,
+            "BF16 result contains Inf"
+        );
+    }
+
+    // ==================== Cross-Precision Consistency Tests ====================
+
+    #[test]
+    fn test_cross_precision_consistency() {
+        // Results from different precisions should be broadly consistent
+        // (not identical due to precision differences, but similar)
+        let g = Tensor::randn([8, 8], (Kind::Float, Device::Cpu));
+
+        let result_fp32 = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
+        let result_fp16 = polar_express_impl(&g, 5, Kind::Half, Kind::Float);
+        let result_bf16 = polar_express_impl(&g, 5, Kind::BFloat16, Kind::Float);
+
+        // All results should be orthogonal (use relaxed tolerances for random matrices)
+        assert_orthogonal(&result_fp32, 0.3, "FP32 cross-precision");
+        assert_orthogonal(&result_fp16, 0.35, "FP16 cross-precision");
+        assert_orthogonal(&result_bf16, 0.35, "BF16 cross-precision");
+
+        // FP32 vs FP16 should be similar (not identical)
+        let diff_fp32_fp16 = (&result_fp32 - &result_fp16).abs().max().double_value(&[]);
+        assert!(
+            diff_fp32_fp16 < 0.5,
+            "FP32 and FP16 results differ too much: {diff_fp32_fp16}"
+        );
+
+        // FP32 vs BF16 should be similar
+        let diff_fp32_bf16 = (&result_fp32 - &result_bf16).abs().max().double_value(&[]);
+        assert!(
+            diff_fp32_bf16 < 0.5,
+            "FP32 and BF16 results differ too much: {diff_fp32_bf16}"
+        );
+
+        // FP16 vs BF16 should be similar (both have ~same precision)
+        let diff_fp16_bf16 = (&result_fp16 - &result_bf16).abs().max().double_value(&[]);
+        assert!(
+            diff_fp16_bf16 < 0.5,
+            "FP16 and BF16 results differ too much: {diff_fp16_bf16}"
+        );
+    }
+
+    #[test]
+    fn test_cross_precision_preserves_scale() {
+        // Regardless of precision, output should have similar Frobenius norm
+        // (orthogonal matrices have norm = sqrt(min(m,n)))
+        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+
+        let result_fp32 = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
+        let result_fp16 = polar_express_impl(&g, 5, Kind::Half, Kind::Float);
+        let result_bf16 = polar_express_impl(&g, 5, Kind::BFloat16, Kind::Float);
+
+        let norm_fp32 = result_fp32.norm().double_value(&[]);
+        let norm_fp16 = result_fp16.norm().double_value(&[]);
+        let norm_bf16 = result_bf16.norm().double_value(&[]);
+
+        // Expected norm for orthogonal 16x16 matrix is sqrt(16) = 4.0
+        let expected_norm = 4.0;
+        let tolerance = 0.5;
+
+        assert!(
+            (norm_fp32 - expected_norm).abs() < tolerance,
+            "FP32 norm unexpected: {norm_fp32} (expected ~{expected_norm})"
+        );
+        assert!(
+            (norm_fp16 - expected_norm).abs() < tolerance,
+            "FP16 norm unexpected: {norm_fp16} (expected ~{expected_norm})"
+        );
+        assert!(
+            (norm_bf16 - expected_norm).abs() < tolerance,
+            "BF16 norm unexpected: {norm_bf16} (expected ~{expected_norm})"
+        );
     }
 }
