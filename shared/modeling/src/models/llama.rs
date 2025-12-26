@@ -29,6 +29,11 @@ pub struct LlamaConfig {
     pub max_position_embeddings: usize,
     pub tie_word_embeddings: bool,
     pub attention_bias: Option<bool>,
+    /// Sliding window attention size. If set, each token only attends to the
+    /// last `sliding_window` tokens instead of the full sequence.
+    /// Compatible with Flash Attention 2 only.
+    #[serde(default)]
+    pub sliding_window: Option<i64>,
 }
 
 impl LlamaConfig {
@@ -53,6 +58,7 @@ impl LlamaConfig {
             max_position_embeddings: 2048,
             tie_word_embeddings: false,
             attention_bias: None,
+            sliding_window: None,
         }
     }
 }
@@ -193,6 +199,7 @@ impl Block {
             (config.max_position_embeddings + 1) as i64,
             attn_implementation,
             comm.clone(),
+            config.sliding_window,
         );
         let rms_2 = RMSNorm::new(
             &vs / "post_attention_layernorm",

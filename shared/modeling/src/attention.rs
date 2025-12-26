@@ -61,6 +61,9 @@ pub struct CausalSelfAttention {
     device: Device,
     attn_implementation: AttentionImplementation,
     tp_size: i64,
+    /// Sliding window size. If Some(w), each token only attends to the last w tokens.
+    /// Only supported with FlashAttention2.
+    sliding_window: Option<i64>,
 }
 
 impl CausalSelfAttention {
@@ -72,6 +75,7 @@ impl CausalSelfAttention {
         n_max_seq_len: i64,
         attn_implementation: AttentionImplementation,
         comm: Option<Arc<Communicator>>,
+        sliding_window: Option<i64>,
     ) -> Self {
         let tp_size = comm.as_ref().map(|x| x.size()).unwrap_or(1);
         assert_eq!(n_head % tp_size, 0, "n_head must be divisible by tp_size");
@@ -106,6 +110,7 @@ impl CausalSelfAttention {
             device: vs.device(),
             attn_implementation,
             tp_size,
+            sliding_window,
         }
     }
 
@@ -180,8 +185,8 @@ impl CausalSelfAttention {
                     t > 1,
                     false,
                     Some(scale),
-                    None,
-                    None,
+                    self.sliding_window, // window_size_left: attend to last W tokens
+                    Some(0i64),          // window_size_right: 0 for causal (no future)
                     None,
                     None,
                 )
