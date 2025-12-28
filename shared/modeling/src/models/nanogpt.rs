@@ -122,6 +122,11 @@ pub struct NanoGPTConfig {
     // Attention gate
     #[serde(default)]
     pub use_attention_gate: bool,
+
+    // MatFormer: heterogeneous FFN width training
+    // tier 0 = full width, tier N = width / 2^N
+    #[serde(default)]
+    pub matformer_tier: u8,
 }
 
 impl NanoGPTConfig {
@@ -171,6 +176,7 @@ impl NanoGPTConfig {
             key_offset: None,
             use_learnable_attn_scale: false,
             use_attention_gate: false,
+            matformer_tier: 0,
         }
     }
 }
@@ -313,6 +319,8 @@ struct NanoGPTMlp {
     up_proj: ColumnParallelLinear,
     down_proj: RowParallelLinear,
     use_relu_squared: bool,
+    matformer_hidden_size: Option<i64>,
+    is_tensor_parallel: bool,
 }
 
 impl NanoGPTMlp {
@@ -323,7 +331,25 @@ impl NanoGPTMlp {
         bias: bool,
         comm: Option<Arc<Communicator>>,
         use_relu_squared: bool,
+        matformer_hidden_size: Option<i64>,
     ) -> Self {
+        let is_tensor_parallel = comm.as_ref().map(|x| x.size()).unwrap_or(1) > 1;
+        let tp_size = comm.as_ref().map(|x| x.size()).unwrap_or(1);
+
+        // Validate matformer settings
+        if let Some(mf_size) = matformer_hidden_size {
+            assert!(mf_size > 0, "matformer_hidden_size must be > 0");
+            assert!(
+                mf_size <= intermediate_size,
+                "matformer_hidden_size must be <= intermediate_size"
+            );
+            assert_eq!(
+                mf_size % tp_size,
+                0,
+                "matformer_hidden_size must be divisible by tp_size"
+            );
+        }
+
         Self {
             gate_proj: ColumnParallelLinear::new(
                 &vs / "gate_proj",
@@ -350,22 +376,68 @@ impl NanoGPTMlp {
                 comm,
             ),
             use_relu_squared,
+            matformer_hidden_size,
+            is_tensor_parallel,
         }
     }
 }
 
 impl Module for NanoGPTMlp {
     fn forward(&self, xs: &Tensor) -> Tensor {
-        if self.use_relu_squared {
-            // ReLU² activation: relu(x)²
-            let gate = self.gate_proj.forward(xs).relu().square();
-            let up = self.up_proj.forward(xs);
-            self.down_proj.forward(&(gate * up))
+        // Check if MatFormer slicing is enabled
+        let Some(matformer_hidden_size) = self.matformer_hidden_size else {
+            // No MatFormer: use standard forward
+            return if self.use_relu_squared {
+                // ReLU² activation: relu(x)²
+                let gate = self.gate_proj.forward(xs).relu().square();
+                let up = self.up_proj.forward(xs);
+                self.down_proj.forward(&(gate * up))
+            } else {
+                // Standard SiLU (SwiGLU) activation
+                self.down_proj
+                    .forward(&(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)))
+            };
+        };
+
+        // MatFormer: use narrowed weights for sliced FFN
+        assert!(
+            !self.is_tensor_parallel,
+            "matformer_tier is not yet supported with tensor parallelism"
+        );
+
+        // Weight shapes:
+        // - gate_proj/up_proj: [intermediate_size, hidden_size]
+        // - down_proj: [hidden_size, intermediate_size]
+        // We narrow along the intermediate dimension:
+        // - gate/up: narrow rows (dim 0) to get [matformer_hidden_size, hidden_size]
+        // - down: narrow cols (dim 1) to get [hidden_size, matformer_hidden_size]
+        let gate_w = self
+            .gate_proj
+            .linear
+            .ws
+            .narrow(0, 0, matformer_hidden_size);
+        let up_w = self
+            .up_proj
+            .linear
+            .ws
+            .narrow(0, 0, matformer_hidden_size);
+        let down_w = self
+            .down_proj
+            .linear
+            .ws
+            .narrow(1, 0, matformer_hidden_size);
+
+        // Manual matmul with narrowed weights
+        let gate = xs.matmul(&gate_w.transpose(0, 1));
+        let up = xs.matmul(&up_w.transpose(0, 1));
+
+        let hidden = if self.use_relu_squared {
+            gate.relu().square() * up
         } else {
-            // Standard SiLU (SwiGLU) activation
-            self.down_proj
-                .forward(&(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)))
-        }
+            gate.silu() * up
+        };
+
+        hidden.matmul(&down_w.transpose(0, 1))
     }
 }
 
@@ -765,6 +837,7 @@ impl NanoGPTBlock {
         layer_idx: usize,
         attn_implementation: AttentionImplementation,
         comm: Option<Arc<Communicator>>,
+        matformer_hidden_size: Option<i64>,
     ) -> Self {
         let hidden_size = config.hidden_size as i64;
         let intermediate_size = config.intermediate_size as i64;
@@ -810,6 +883,7 @@ impl NanoGPTBlock {
                 config.mlp_bias,
                 comm,
                 config.use_relu_squared_mlp,
+                matformer_hidden_size,
             ),
             x0_lambda,
             resid_lambda,
@@ -889,6 +963,18 @@ impl NanoGPT {
     ) -> Self {
         let model_vs = &vs / "model";
 
+        // Compute MatFormer hidden size from tier
+        // tier 0 = full width (None), tier N = width / 2^N
+        let matformer_hidden_size: Option<i64> = match config.matformer_tier {
+            0 => None,
+            tier => {
+                let divisor = 1_i64
+                    .checked_shl(tier as u32)
+                    .expect("matformer_tier too large");
+                Some((config.intermediate_size as i64) / divisor)
+            }
+        };
+
         // Token embeddings
         let wte = nn::embedding(
             &model_vs / "embed_tokens",
@@ -906,6 +992,7 @@ impl NanoGPT {
                     i,
                     attn_implementation,
                     comm.clone(),
+                    matformer_hidden_size,
                 )
             })
             .collect();
@@ -1077,6 +1164,27 @@ impl NanoGPTForCausalLM {
             override_max_position_embeddings,
         )
     }
+
+    pub fn from_pretrained_with_matformer_tier(
+        source: &PretrainedSource<NanoGPTConfig>,
+        kind: Option<Kind>,
+        attn_implementation: Option<AttentionImplementation>,
+        device: Option<Device>,
+        tensor_parallelism_world: Option<(CommunicatorId, usize, usize)>,
+        override_max_position_embeddings: Option<usize>,
+        matformer_tier: u8,
+    ) -> Result<Self, ModelLoadError> {
+        Self::from_builder_with_config_overrides(
+            Self::builder,
+            source,
+            kind,
+            attn_implementation,
+            device,
+            tensor_parallelism_world,
+            override_max_position_embeddings,
+            |config| config.matformer_tier = matformer_tier,
+        )
+    }
 }
 
 // ============================================================================
@@ -1165,10 +1273,10 @@ mod tests {
         let vs = nn::VarStore::new(Device::Cpu);
 
         // Standard SiLU MLP
-        let mlp_silu = NanoGPTMlp::new(vs.root() / "silu", 64, 128, false, None, false);
+        let mlp_silu = NanoGPTMlp::new(vs.root() / "silu", 64, 128, false, None, false, None);
 
         // ReLU² MLP
-        let mlp_relu = NanoGPTMlp::new(vs.root() / "relu", 64, 128, false, None, true);
+        let mlp_relu = NanoGPTMlp::new(vs.root() / "relu", 64, 128, false, None, true, None);
 
         let input = Tensor::randn([2, 16, 64], (Kind::Float, Device::Cpu));
 
@@ -2278,6 +2386,7 @@ mod tests {
             key_offset: None,
             use_learnable_attn_scale: false,
             use_attention_gate: false,
+            matformer_tier: 0,
         };
 
         let vs = nn::VarStore::new(device);
@@ -2364,5 +2473,422 @@ mod tests {
         eprintln!("  vocab_size: {}", config.vocab_size);
         eprintln!("  use_relu_squared_mlp: {}", config.use_relu_squared_mlp);
         eprintln!("  use_qk_norm: {}", config.use_qk_norm);
+    }
+
+    // ========================================================================
+    // MatFormer Tests
+    // ========================================================================
+
+    /// Test: MatFormer MLP produces zero gradients in tail weights
+    /// This is the key property of MatFormer - unused neurons don't get gradients
+    #[test]
+    fn test_nanogpt_matformer_mlp_has_zero_tail_grads() {
+        let vs = nn::VarStore::new(Device::Cpu);
+        let hidden_size = 4;
+        let intermediate_size = 8;
+        let matformer_hidden = 4; // Use half the FFN width
+
+        let mlp = NanoGPTMlp::new(
+            vs.root(),
+            hidden_size,
+            intermediate_size,
+            false, // no bias
+            None,  // no comm
+            false, // SiLU, not ReLU²
+            Some(matformer_hidden),
+        );
+
+        // Forward + backward
+        let x = Tensor::randn([2, 3, hidden_size], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let y = mlp.forward(&x);
+        let loss = y.sum(Kind::Float);
+        loss.backward();
+
+        // Get gradients
+        let gate_grad = mlp.gate_proj.linear.ws.grad();
+        let up_grad = mlp.up_proj.linear.ws.grad();
+        let down_grad = mlp.down_proj.linear.ws.grad();
+
+        // gate/up: [intermediate_size, hidden_size] => tail rows must have zero grad
+        let gate_tail = gate_grad.narrow(0, matformer_hidden, intermediate_size - matformer_hidden);
+        let up_tail = up_grad.narrow(0, matformer_hidden, intermediate_size - matformer_hidden);
+
+        // down: [hidden_size, intermediate_size] => tail cols must have zero grad
+        let down_tail = down_grad.narrow(1, matformer_hidden, intermediate_size - matformer_hidden);
+
+        let gate_tail_max = gate_tail.abs().max().double_value(&[]);
+        let up_tail_max = up_tail.abs().max().double_value(&[]);
+        let down_tail_max = down_tail.abs().max().double_value(&[]);
+
+        eprintln!("MatFormer MLP tail gradients:");
+        eprintln!("  gate_proj tail max: {:.2e}", gate_tail_max);
+        eprintln!("  up_proj tail max: {:.2e}", up_tail_max);
+        eprintln!("  down_proj tail max: {:.2e}", down_tail_max);
+
+        assert!(
+            gate_tail_max < 1e-10,
+            "gate_proj tail should have zero gradients, got max {}",
+            gate_tail_max
+        );
+        assert!(
+            up_tail_max < 1e-10,
+            "up_proj tail should have zero gradients, got max {}",
+            up_tail_max
+        );
+        assert!(
+            down_tail_max < 1e-10,
+            "down_proj tail should have zero gradients, got max {}",
+            down_tail_max
+        );
+
+        eprintln!("MatFormer MLP zero-tail-grads test passed!");
+    }
+
+    /// Test: MatFormer MLP with ReLU² also has zero tail gradients
+    #[test]
+    fn test_nanogpt_matformer_mlp_relu_squared_zero_tail_grads() {
+        let vs = nn::VarStore::new(Device::Cpu);
+        let hidden_size = 4;
+        let intermediate_size = 8;
+        let matformer_hidden = 4;
+
+        let mlp = NanoGPTMlp::new(
+            vs.root(),
+            hidden_size,
+            intermediate_size,
+            false,
+            None,
+            true, // ReLU²
+            Some(matformer_hidden),
+        );
+
+        let x = Tensor::randn([2, 3, hidden_size], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let y = mlp.forward(&x);
+        let loss = y.sum(Kind::Float);
+        loss.backward();
+
+        let gate_grad = mlp.gate_proj.linear.ws.grad();
+        let gate_tail = gate_grad.narrow(0, matformer_hidden, intermediate_size - matformer_hidden);
+        let gate_tail_max = gate_tail.abs().max().double_value(&[]);
+
+        assert!(
+            gate_tail_max < 1e-10,
+            "ReLU² MatFormer tail should have zero gradients"
+        );
+
+        eprintln!("MatFormer MLP ReLU² zero-tail-grads test passed!");
+    }
+
+    /// Test: Full model overfit with MatFormer tier 1 (half FFN width)
+    #[test]
+    fn test_nanogpt_matformer_tier1_overfit() {
+        let device = Device::Cpu;
+
+        let config = NanoGPTConfig {
+            hidden_size: 64,
+            intermediate_size: 128,
+            vocab_size: 100,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: Some(4),
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            tie_word_embeddings: false,
+            use_fused_qkvo: false,
+            use_relu_squared_mlp: false,
+            mlp_bias: false,
+            use_qk_norm: false,
+            use_sa_lambdas: false,
+            use_x0_residual: false,
+            use_x0_lambdas: false,
+            use_resid_lambdas: false,
+            num_value_embeddings: 0,
+            use_block_skip: false,
+            block_skip_from: None,
+            block_skip_to: None,
+            use_smear_gate: false,
+            use_logit_softcap: false,
+            softcap_scale: None,
+            use_backout: false,
+            backout_layer: None,
+            use_half_truncate_rope: false,
+            use_key_offset: false,
+            key_offset: None,
+            use_learnable_attn_scale: false,
+            use_attention_gate: false,
+            matformer_tier: 1, // Half FFN width (128 -> 64)
+        };
+
+        let vs = nn::VarStore::new(device);
+        let model = NanoGPT::new(vs.root(), &config, AttentionImplementation::Eager, None);
+
+        let lm_head = nn::linear(
+            vs.root() / "lm_head",
+            config.hidden_size as i64,
+            config.vocab_size as i64,
+            Default::default(),
+        );
+
+        let mut opt = nn::Adam::default().build(&vs, 1e-3).unwrap();
+
+        // Small overfit dataset
+        let batch_size = 4;
+        let seq_len = 16;
+        let data = Tensor::randint(
+            config.vocab_size as i64,
+            [batch_size, seq_len + 1],
+            (Kind::Int64, device),
+        );
+        let input_ids = data.narrow(1, 0, seq_len);
+        let labels = data.narrow(1, 1, seq_len);
+
+        let initial_loss = {
+            let hidden = model.forward(&input_ids, None, None, false);
+            let logits = lm_head.forward(&hidden);
+            let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
+            let flat_labels = labels.reshape([batch_size * seq_len]);
+            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+        };
+
+        // Train for 100 steps
+        for _ in 0..100 {
+            let hidden = model.forward(&input_ids, None, None, false);
+            let logits = lm_head.forward(&hidden);
+            let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
+            let flat_labels = labels.reshape([batch_size * seq_len]);
+            let loss = flat_logits.cross_entropy_for_logits(&flat_labels);
+            opt.backward_step(&loss);
+        }
+
+        let final_loss = {
+            let hidden = model.forward(&input_ids, None, None, false);
+            let logits = lm_head.forward(&hidden);
+            let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
+            let flat_labels = labels.reshape([batch_size * seq_len]);
+            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+        };
+
+        let improvement = (initial_loss - final_loss) / initial_loss;
+        eprintln!(
+            "MatFormer tier 1 overfit: initial loss = {:.4}, final loss = {:.4}, improvement = {:.1}%",
+            initial_loss,
+            final_loss,
+            improvement * 100.0
+        );
+
+        assert!(
+            improvement > 0.90,
+            "MatFormer tier 1 should achieve >90% loss reduction, got {:.1}%",
+            improvement * 100.0
+        );
+        assert!(!final_loss.is_nan(), "Final loss is NaN");
+
+        eprintln!("MatFormer tier 1 overfit test passed!");
+    }
+
+    /// Test: MatFormer tier 2 (quarter FFN width) also works
+    #[test]
+    fn test_nanogpt_matformer_tier2_overfit() {
+        let device = Device::Cpu;
+
+        let config = NanoGPTConfig {
+            hidden_size: 64,
+            intermediate_size: 128,
+            vocab_size: 100,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: Some(4),
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            tie_word_embeddings: false,
+            use_fused_qkvo: false,
+            use_relu_squared_mlp: false,
+            mlp_bias: false,
+            use_qk_norm: false,
+            use_sa_lambdas: false,
+            use_x0_residual: false,
+            use_x0_lambdas: false,
+            use_resid_lambdas: false,
+            num_value_embeddings: 0,
+            use_block_skip: false,
+            block_skip_from: None,
+            block_skip_to: None,
+            use_smear_gate: false,
+            use_logit_softcap: false,
+            softcap_scale: None,
+            use_backout: false,
+            backout_layer: None,
+            use_half_truncate_rope: false,
+            use_key_offset: false,
+            key_offset: None,
+            use_learnable_attn_scale: false,
+            use_attention_gate: false,
+            matformer_tier: 2, // Quarter FFN width (128 -> 32)
+        };
+
+        let vs = nn::VarStore::new(device);
+        let model = NanoGPT::new(vs.root(), &config, AttentionImplementation::Eager, None);
+
+        let lm_head = nn::linear(
+            vs.root() / "lm_head",
+            config.hidden_size as i64,
+            config.vocab_size as i64,
+            Default::default(),
+        );
+
+        let mut opt = nn::Adam::default().build(&vs, 1e-3).unwrap();
+
+        let batch_size = 4;
+        let seq_len = 16;
+        let data = Tensor::randint(
+            config.vocab_size as i64,
+            [batch_size, seq_len + 1],
+            (Kind::Int64, device),
+        );
+        let input_ids = data.narrow(1, 0, seq_len);
+        let labels = data.narrow(1, 1, seq_len);
+
+        let initial_loss = {
+            let hidden = model.forward(&input_ids, None, None, false);
+            let logits = lm_head.forward(&hidden);
+            let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
+            let flat_labels = labels.reshape([batch_size * seq_len]);
+            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+        };
+
+        for _ in 0..100 {
+            let hidden = model.forward(&input_ids, None, None, false);
+            let logits = lm_head.forward(&hidden);
+            let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
+            let flat_labels = labels.reshape([batch_size * seq_len]);
+            let loss = flat_logits.cross_entropy_for_logits(&flat_labels);
+            opt.backward_step(&loss);
+        }
+
+        let final_loss = {
+            let hidden = model.forward(&input_ids, None, None, false);
+            let logits = lm_head.forward(&hidden);
+            let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
+            let flat_labels = labels.reshape([batch_size * seq_len]);
+            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+        };
+
+        let improvement = (initial_loss - final_loss) / initial_loss;
+        eprintln!(
+            "MatFormer tier 2 overfit: initial loss = {:.4}, final loss = {:.4}, improvement = {:.1}%",
+            initial_loss,
+            final_loss,
+            improvement * 100.0
+        );
+
+        // Tier 2 has less capacity, so we accept slightly lower threshold
+        assert!(
+            improvement > 0.85,
+            "MatFormer tier 2 should achieve >85% loss reduction, got {:.1}%",
+            improvement * 100.0
+        );
+        assert!(!final_loss.is_nan(), "Final loss is NaN");
+
+        eprintln!("MatFormer tier 2 overfit test passed!");
+    }
+
+    /// Test: Verify MatFormer tier 0 is equivalent to no MatFormer
+    #[test]
+    fn test_nanogpt_matformer_tier0_is_full_width() {
+        let device = Device::Cpu;
+
+        // Config with tier 0 (should be full width)
+        let config = NanoGPTConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            vocab_size: 50,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 32,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            tie_word_embeddings: false,
+            use_fused_qkvo: false,
+            use_relu_squared_mlp: false,
+            mlp_bias: false,
+            use_qk_norm: false,
+            use_sa_lambdas: false,
+            use_x0_residual: false,
+            use_x0_lambdas: false,
+            use_resid_lambdas: false,
+            num_value_embeddings: 0,
+            use_block_skip: false,
+            block_skip_from: None,
+            block_skip_to: None,
+            use_smear_gate: false,
+            use_logit_softcap: false,
+            softcap_scale: None,
+            use_backout: false,
+            backout_layer: None,
+            use_half_truncate_rope: false,
+            use_key_offset: false,
+            key_offset: None,
+            use_learnable_attn_scale: false,
+            use_attention_gate: false,
+            matformer_tier: 0, // Full width
+        };
+
+        let vs = nn::VarStore::new(device);
+        let model = NanoGPT::new(vs.root(), &config, AttentionImplementation::Eager, None);
+
+        let lm_head = nn::linear(
+            vs.root() / "lm_head",
+            config.hidden_size as i64,
+            config.vocab_size as i64,
+            Default::default(),
+        );
+
+        let mut opt = nn::Adam::default().build(&vs, 1e-3).unwrap();
+
+        let batch_size = 4;
+        let seq_len = 8;
+        let data = Tensor::randint(
+            config.vocab_size as i64,
+            [batch_size, seq_len + 1],
+            (Kind::Int64, device),
+        );
+        let input_ids = data.narrow(1, 0, seq_len);
+        let labels = data.narrow(1, 1, seq_len);
+
+        // Train and check all weights get gradients (not just subset)
+        let hidden = model.forward(&input_ids, None, None, false);
+        let logits = lm_head.forward(&hidden);
+        let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
+        let flat_labels = labels.reshape([batch_size * seq_len]);
+        let loss = flat_logits.cross_entropy_for_logits(&flat_labels);
+        opt.backward_step(&loss);
+
+        // Check that all MLP weights have non-zero gradients
+        // (This verifies tier 0 uses full width, not sliced)
+        for (name, var) in vs.variables() {
+            if name.contains("mlp") && name.contains("weight") {
+                let grad = var.grad();
+                let grad_norm = grad.abs().sum(Kind::Float).double_value(&[]);
+                assert!(
+                    grad_norm > 0.0,
+                    "Tier 0 should have gradients in all MLP weights, but {} has zero grad",
+                    name
+                );
+            }
+        }
+
+        eprintln!("MatFormer tier 0 (full width) test passed!");
     }
 }

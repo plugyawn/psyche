@@ -790,13 +790,14 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }
                                             model::LLMArchitecture::HfNanoGPT => {
-                                                NanoGPTForCausalLM::from_pretrained(
+                                                NanoGPTForCausalLM::from_pretrained_with_matformer_tier(
                                                     &source.try_into()?,
                                                     Some(kind),
                                                     attn_implementation,
                                                     Some(device),
                                                     tensor_parallelism_world,
                                                     Some(llm.max_seq_len as usize),
+                                                    matformer_tier,
                                                 )
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }
