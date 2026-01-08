@@ -1266,6 +1266,30 @@ impl NanoGPTForCausalLM {
         override_max_position_embeddings: Option<usize>,
         matformer_tier: u8,
     ) -> Result<Self, ModelLoadError> {
+        Self::from_pretrained_with_matformer_config(
+            source,
+            kind,
+            attn_implementation,
+            device,
+            tensor_parallelism_world,
+            override_max_position_embeddings,
+            matformer_tier,
+            0.0,
+            16,
+        )
+    }
+
+    pub fn from_pretrained_with_matformer_config(
+        source: &PretrainedSource<NanoGPTConfig>,
+        kind: Option<Kind>,
+        attn_implementation: Option<AttentionImplementation>,
+        device: Option<Device>,
+        tensor_parallelism_world: Option<(CommunicatorId, usize, usize)>,
+        override_max_position_embeddings: Option<usize>,
+        matformer_tier: u8,
+        matformer_helper_fraction: f32,
+        matformer_helper_rotation_interval: u64,
+    ) -> Result<Self, ModelLoadError> {
         Self::from_builder_with_config_overrides(
             Self::builder,
             source,
@@ -1274,7 +1298,11 @@ impl NanoGPTForCausalLM {
             device,
             tensor_parallelism_world,
             override_max_position_embeddings,
-            |config| config.matformer_tier = matformer_tier,
+            |config| {
+                config.matformer_tier = matformer_tier;
+                config.matformer_helper_fraction = matformer_helper_fraction;
+                config.matformer_helper_rotation_interval = matformer_helper_rotation_interval;
+            },
         )
     }
 }

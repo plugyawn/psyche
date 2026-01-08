@@ -56,6 +56,8 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub device: Devices,
     pub matformer_tier: u8,
     pub matformer_load_strategy: MatformerLoadStrategy,
+    pub matformer_helper_fraction: f32,
+    pub matformer_helper_rotation_interval: u64,
     pub hub_read_token: Option<String>,
     pub hub_max_concurrent_downloads: usize,
     pub data_parallelism: usize,
@@ -733,6 +735,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             );
                             let devices = init_config.device.clone();
                             let matformer_tier = matformer_tier_for_loading;
+                            let helper_fraction = init_config.matformer_helper_fraction;
+                            let helper_rotation_interval =
+                                init_config.matformer_helper_rotation_interval;
 
                             for dp in 0..init_config.data_parallelism {
                                 let communicator_id: Option<CommunicatorId> =
@@ -767,7 +772,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                         };
                                         match llm.architecture {
                                             model::LLMArchitecture::HfLlama => {
-                                                LlamaForCausalLM::from_pretrained_with_matformer_tier(
+                                                LlamaForCausalLM::from_pretrained_with_matformer_config(
                                                     &source.try_into()?,
                                                     Some(kind),
                                                     attn_implementation,
@@ -775,6 +780,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                                     tensor_parallelism_world,
                                                     Some(llm.max_seq_len as usize),
                                                     matformer_tier,
+                                                    helper_fraction,
+                                                    helper_rotation_interval,
                                                 )
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }
@@ -790,7 +797,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }
                                             model::LLMArchitecture::HfNanoGPT => {
-                                                NanoGPTForCausalLM::from_pretrained_with_matformer_tier(
+                                                NanoGPTForCausalLM::from_pretrained_with_matformer_config(
                                                     &source.try_into()?,
                                                     Some(kind),
                                                     attn_implementation,
@@ -798,6 +805,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                                     tensor_parallelism_world,
                                                     Some(llm.max_seq_len as usize),
                                                     matformer_tier,
+                                                    helper_fraction,
+                                                    helper_rotation_interval,
                                                 )
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }

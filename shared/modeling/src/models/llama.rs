@@ -161,6 +161,14 @@ impl Mlp {
         );
         let down_proj =
             RowParallelLinear::new(&vs / "down_proj", n_hidden, n_embd, false, true, comm);
+
+        if let Some(ref config) = helper_config {
+            eprintln!(
+                "[MLP layer {}] Helper mode enabled: fraction={}, rotation_interval={}, matformer_hidden={}",
+                layer_idx, config.helper_fraction, config.rotation_interval, matformer_hidden_size.unwrap_or(n_hidden)
+            );
+        }
+
         Self {
             gate_proj,
             up_proj,
@@ -471,6 +479,30 @@ impl LlamaForCausalLM {
         override_max_position_embeddings: Option<usize>,
         matformer_tier: u8,
     ) -> Result<Self, ModelLoadError> {
+        Self::from_pretrained_with_matformer_config(
+            source,
+            kind,
+            attn_implementation,
+            device,
+            tensor_parallelism_world,
+            override_max_position_embeddings,
+            matformer_tier,
+            0.0,
+            16,
+        )
+    }
+
+    pub fn from_pretrained_with_matformer_config(
+        source: &PretrainedSource<LlamaConfig>,
+        kind: Option<Kind>,
+        attn_implementation: Option<AttentionImplementation>,
+        device: Option<Device>,
+        tensor_parallelism_world: Option<(CommunicatorId, usize, usize)>,
+        override_max_position_embeddings: Option<usize>,
+        matformer_tier: u8,
+        matformer_helper_fraction: f32,
+        matformer_helper_rotation_interval: u64,
+    ) -> Result<Self, ModelLoadError> {
         Self::from_builder_with_config_overrides(
             Self::builder,
             source,
@@ -479,7 +511,11 @@ impl LlamaForCausalLM {
             device,
             tensor_parallelism_world,
             override_max_position_embeddings,
-            |config| config.matformer_tier = matformer_tier,
+            |config| {
+                config.matformer_tier = matformer_tier;
+                config.matformer_helper_fraction = matformer_helper_fraction;
+                config.matformer_helper_rotation_interval = matformer_helper_rotation_interval;
+            },
         )
     }
 }
