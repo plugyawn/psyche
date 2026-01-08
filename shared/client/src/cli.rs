@@ -200,6 +200,20 @@ pub struct TrainArgs {
     #[clap(long, env, value_enum, default_value_t = MatformerLoadStrategy::Auto)]
     pub matformer_load_strategy: MatformerLoadStrategy,
 
+    /// Fraction of suffix neurons to help train (0.0-1.0).
+    /// When > 0, this tier will also train a random sample of neurons
+    /// outside its normal range, helping larger tiers converge faster.
+    /// Only applies to tiers > 0.
+    #[clap(long, env, default_value_t = 0.0)]
+    pub matformer_helper_fraction: f32,
+
+    /// How many rounds to keep helper indices fixed before rotating.
+    /// Higher values allow DisTrO delta to accumulate; lower values
+    /// give faster coverage of all suffix neurons.
+    /// Recommended: 8-32 rounds.
+    #[clap(long, env, default_value_t = 16)]
+    pub matformer_helper_rotation_interval: u64,
+
     /// Log a one-time memory snapshot (RSS and, if available, GPU memory) when training starts.
     #[clap(long, env, default_value_t = false)]
     pub log_memory_usage: bool,

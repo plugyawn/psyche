@@ -9,6 +9,7 @@ mod distro;
 mod dummy;
 mod fp32_gradient_accumulator;
 pub mod kernels;
+pub mod matformer_helper;
 pub mod metrics;
 mod models;
 pub mod muon;
