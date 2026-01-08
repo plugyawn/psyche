@@ -41,6 +41,10 @@ fn default_rms_norm_eps() -> f64 {
     1e-6
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Configuration for NanoGPT model
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct NanoGPTConfig {
@@ -81,6 +85,10 @@ pub struct NanoGPTConfig {
     // QK-Norm
     #[serde(default)]
     pub use_qk_norm: bool,
+    /// If true (default), apply QK-norm before RoPE (modded-nanogpt style).
+    /// If false, apply after RoPE.
+    #[serde(default = "default_true")]
+    pub qk_norm_before_rope: bool,
 
     // SA Lambdas (learnable scalars on Q, K, V, O)
     #[serde(default)]
@@ -122,6 +130,8 @@ pub struct NanoGPTConfig {
     pub key_offset: Option<i64>,
     #[serde(default)]
     pub use_learnable_attn_scale: bool,
+    /// Fixed attention scale (overrides 1/sqrt(d)). modded-nanogpt uses 0.1-0.12.
+    pub attention_scale: Option<f64>,
 
     // Attention gate
     #[serde(default)]
@@ -172,6 +182,7 @@ impl NanoGPTConfig {
             use_relu_squared_mlp: false,
             mlp_bias: false,
             use_qk_norm: false,
+            qk_norm_before_rope: true,
             use_sa_lambdas: false,
             use_x0_residual: false,
             use_x0_lambdas: false,
@@ -189,6 +200,7 @@ impl NanoGPTConfig {
             use_key_offset: false,
             key_offset: None,
             use_learnable_attn_scale: false,
+            attention_scale: None,
             use_attention_gate: false,
             matformer_tier: 0,
             matformer_helper_fraction: 0.0,
@@ -334,6 +346,15 @@ impl LanguageModelConfig for NanoGPTConfig {
 
     fn eos_token_ids(&self) -> Option<EosToks> {
         self.eos_token_id.clone()
+    }
+
+    fn logit_softcap_scale(&self) -> Option<f64> {
+        if self.use_logit_softcap {
+            // Default scale is 30.0 (modded-nanogpt default)
+            Some(self.softcap_scale.unwrap_or(30.0))
+        } else {
+            None
+        }
     }
 }
 
@@ -564,6 +585,8 @@ struct NanoGPTAttention {
 
     // Config
     use_fused_qkvo: bool,
+    qk_norm_before_rope: bool,
+    fixed_attn_scale: Option<f64>,
     attn_implementation: AttentionImplementation,
     tp_size: i64,
     device: Device,
@@ -702,6 +725,8 @@ impl NanoGPTAttention {
             size_q,
             size_kv,
             use_fused_qkvo: config.use_fused_qkvo,
+            qk_norm_before_rope: config.qk_norm_before_rope,
+            fixed_attn_scale: config.attention_scale,
             attn_implementation,
             tp_size,
             device: vs.device(),
@@ -767,21 +792,43 @@ impl NanoGPTAttention {
             .reshape([b, t, local_n_kvhead, self.head_dim])
             .transpose(1, 2);
 
+        // Apply QK-Norm BEFORE RoPE if configured (modded-nanogpt style)
+        // Shape is [b, n_heads, t, head_dim], norm operates on last dim
+        let (q, k) = if self.qk_norm_before_rope {
+            let q = if let Some(ref q_norm) = self.q_norm {
+                q_norm.forward(&q)
+            } else {
+                q
+            };
+            let k = if let Some(ref k_norm) = self.k_norm {
+                k_norm.forward(&k)
+            } else {
+                k
+            };
+            (q, k)
+        } else {
+            (q, k)
+        };
+
         // Apply RoPE
         let q = rope_cache.apply_rotary_emb(&q, position_ids).to_kind(kind);
         let k = rope_cache.apply_rotary_emb(&k, position_ids).to_kind(kind);
 
-        // Apply QK-Norm after RoPE
-        // Shape is [b, n_heads, t, head_dim], norm operates on last dim
-        let q = if let Some(ref q_norm) = self.q_norm {
-            q_norm.forward(&q)
+        // Apply QK-Norm AFTER RoPE if configured (legacy style)
+        let (q, k) = if !self.qk_norm_before_rope {
+            let q = if let Some(ref q_norm) = self.q_norm {
+                q_norm.forward(&q)
+            } else {
+                q
+            };
+            let k = if let Some(ref k_norm) = self.k_norm {
+                k_norm.forward(&k)
+            } else {
+                k
+            };
+            (q, k)
         } else {
-            q
-        };
-        let k = if let Some(ref k_norm) = self.k_norm {
-            k_norm.forward(&k)
-        } else {
-            k
+            (q, k)
         };
 
         // Apply SA Lambdas: learnable scalars
@@ -807,12 +854,13 @@ impl NanoGPTAttention {
         let v = if n_rep > 1 { repeat_kv(&v, n_rep) } else { v };
 
         // Attention computation
-        // Use learnable attention scale if available, otherwise 1/sqrt(d)
+        // Priority: fixed_attn_scale > learnable attn_scale > 1/sqrt(d)
         let default_scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scale = self
-            .attn_scale
-            .as_ref()
-            .map_or(default_scale, |s| s.double_value(&[]));
+        let scale = self.fixed_attn_scale.unwrap_or_else(|| {
+            self.attn_scale
+                .as_ref()
+                .map_or(default_scale, |s| s.double_value(&[]))
+        });
 
         let y = match self.attn_implementation {
             #[cfg(feature = "parallelism")]
@@ -1094,12 +1142,13 @@ impl NanoGPT {
             config.rms_norm_eps,
         );
 
-        // RoPE cache
-        let rope_cache = RoPECache::new(
+        // RoPE cache (with optional half-truncate mode)
+        let rope_cache = RoPECache::new_with_options(
             &config.rope_scaling,
             config.head_dim(),
             config.rope_theta,
             &vs.device(),
+            config.use_half_truncate_rope,
         );
 
         // Value embeddings - extra embedding tables mixed into V
@@ -2525,6 +2574,7 @@ mod tests {
             use_relu_squared_mlp: true,
             mlp_bias: false,
             use_qk_norm: true,
+            qk_norm_before_rope: true,
             use_sa_lambdas: false,
             use_x0_residual: false,
             use_x0_lambdas: false,
@@ -2542,6 +2592,7 @@ mod tests {
             use_key_offset: false,
             key_offset: None,
             use_learnable_attn_scale: false,
+            attention_scale: None,
             use_attention_gate: false,
             matformer_tier: 0,
             matformer_helper_fraction: 0.0,
@@ -2774,6 +2825,7 @@ mod tests {
             use_relu_squared_mlp: false,
             mlp_bias: false,
             use_qk_norm: false,
+            qk_norm_before_rope: true,
             use_sa_lambdas: false,
             use_x0_residual: false,
             use_x0_lambdas: false,
@@ -2791,6 +2843,7 @@ mod tests {
             use_key_offset: false,
             key_offset: None,
             use_learnable_attn_scale: false,
+            attention_scale: None,
             use_attention_gate: false,
             matformer_tier: 1, // Half FFN width (128 -> 64)
             matformer_helper_fraction: 0.0,
@@ -2891,6 +2944,7 @@ mod tests {
             use_relu_squared_mlp: false,
             mlp_bias: false,
             use_qk_norm: false,
+            qk_norm_before_rope: true,
             use_sa_lambdas: false,
             use_x0_residual: false,
             use_x0_lambdas: false,
@@ -2908,6 +2962,7 @@ mod tests {
             use_key_offset: false,
             key_offset: None,
             use_learnable_attn_scale: false,
+            attention_scale: None,
             use_attention_gate: false,
             matformer_tier: 2, // Quarter FFN width (128 -> 32)
             matformer_helper_fraction: 0.0,
@@ -3008,6 +3063,7 @@ mod tests {
             use_relu_squared_mlp: false,
             mlp_bias: false,
             use_qk_norm: false,
+            qk_norm_before_rope: true,
             use_sa_lambdas: false,
             use_x0_residual: false,
             use_x0_lambdas: false,
@@ -3025,6 +3081,7 @@ mod tests {
             use_key_offset: false,
             key_offset: None,
             use_learnable_attn_scale: false,
+            attention_scale: None,
             use_attention_gate: false,
             matformer_tier: 0, // Full width
             matformer_helper_fraction: 0.0,
