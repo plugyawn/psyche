@@ -2,12 +2,12 @@ use crate::{
     AllReduce, AttentionImplementation, Communicator, CommunicatorId, ModelConfig, ModelLoadError,
     PretrainedSource, ReduceType, RoPEConfig, StableVarStoreIterator, StableVariableIterator,
 };
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 use tch::{
-    Device, Kind, Tensor,
     nn::{self, Module},
+    Device, Kind, Tensor,
 };
 
 #[cfg(feature = "parallelism")]
@@ -84,6 +84,13 @@ pub trait LanguageModelConfig: ModelConfig + Send + Debug + serde::de::Deseriali
     fn max_position_embeddings(&self) -> usize;
     fn bos_token_id(&self) -> Option<i64>;
     fn eos_token_ids(&self) -> Option<EosToks>;
+
+    /// Returns softcap scale if logit softcapping is enabled.
+    /// Formula: scale * sigmoid(logits / (scale / 4))
+    /// Default: None (no softcapping)
+    fn logit_softcap_scale(&self) -> Option<f64> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -235,6 +242,13 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLM for CausalLanguag
             x = x.slice(1, t - num_logits_to_keep, t, 1);
         }
         let mut logits = self.lm_head.forward(&x);
+
+        // Apply logit softcap if enabled (NanoGPT feature)
+        // Formula: scale * sigmoid(logits / (scale / 4))
+        if let Some(scale) = self.config.logit_softcap_scale() {
+            logits = (logits / (scale / 4.0)).sigmoid() * scale;
+        }
+
         let loss = match labels {
             Some(labels) => {
                 // Upcast to float if we need to compute the loss to avoid potential precision issues
