@@ -21,6 +21,90 @@ fn matformer_prefix_dim(name: &str) -> Option<usize> {
     }
 }
 
+/// Extract layer index from parameter name like "model.layers.5.mlp.gate_proj.weight"
+fn extract_layer_index(name: &str) -> Option<usize> {
+    // Look for "layers.N" pattern
+    let parts: Vec<&str> = name.split('.').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "layers" && i + 1 < parts.len() {
+            return parts[i + 1].parse().ok();
+        }
+    }
+    None
+}
+
+/// Align gradient with non-contiguous MatFormer helper indices.
+///
+/// This function scatters a gradient from a subset of indices back to the full shape.
+/// Used when helper mode is enabled and gradients cover prefix + stochastic suffix indices.
+///
+/// # Arguments
+/// * `name` - Parameter name (e.g., "model.layers.0.mlp.gate_proj.weight")
+/// * `full_shape` - Full shape of the parameter [intermediate_size, hidden_size] or [hidden_size, intermediate_size]
+/// * `grad` - Gradient tensor covering the selected indices
+/// * `indices` - Which indices the gradient covers (e.g., [0,1,2,...,767] + [891,1024,...])
+///
+/// # Returns
+/// Full-sized gradient tensor with values scattered to the correct positions
+pub fn align_matformer_sparse_grad(
+    name: &str,
+    full_shape: &[i64],
+    grad: Tensor,
+    indices: &[i64],
+) -> Result<Tensor, PrefixAlignError> {
+    let grad_shape = grad.size();
+
+    // If already full size, return as-is
+    if grad_shape == full_shape {
+        return Ok(grad);
+    }
+
+    let Some(prefix_dim) = matformer_prefix_dim(name) else {
+        return Err(PrefixAlignError::UnsupportedParameter(name.to_string()));
+    };
+
+    if full_shape.len() != 2 || grad_shape.len() != 2 {
+        return Err(PrefixAlignError::RankMismatch {
+            expected: 2,
+            got: grad_shape.len(),
+        });
+    }
+
+    // Verify the other dimension matches
+    let other_dim = if prefix_dim == 0 { 1 } else { 0 };
+    if grad_shape[other_dim] != full_shape[other_dim] {
+        return Err(PrefixAlignError::ShapeMismatch {
+            full: full_shape.to_vec(),
+            grad: grad_shape,
+        });
+    }
+
+    // Verify grad and indices have compatible sizes
+    if grad_shape[prefix_dim] != indices.len() as i64 {
+        return Err(PrefixAlignError::ShapeMismatch {
+            full: full_shape.to_vec(),
+            grad: grad_shape,
+        });
+    }
+
+    // Create full-size zero tensor
+    let full_grad = Tensor::zeros(full_shape, (grad.kind(), grad.device()));
+
+    // Create index tensor
+    let indices_tensor = Tensor::from_slice(indices).to_device(grad.device());
+
+    // Scatter gradient values to their correct positions
+    if prefix_dim == 0 {
+        // gate_proj, up_proj: indices select rows
+        let _ = full_grad.index_copy_(0, &indices_tensor, &grad);
+    } else {
+        // down_proj: indices select columns
+        let _ = full_grad.index_copy_(1, &indices_tensor, &grad);
+    }
+
+    Ok(full_grad)
+}
+
 fn align_matformer_prefix_grad(
     name: &str,
     full_shape: &[i64],
@@ -354,11 +438,13 @@ impl TransformDCT {
 
             if !self.b_dict.contains_key(&n1) {
                 let i = Tensor::eye(n1, (Kind::Float, device));
-                self.b_dict.insert(n1, Self::idct(&i, true).to_kind(x.kind()));
+                self.b_dict
+                    .insert(n1, Self::idct(&i, true).to_kind(x.kind()));
             }
             if !self.b_dict.contains_key(&n2) {
                 let i = Tensor::eye(n2, (Kind::Float, device));
-                self.b_dict.insert(n2, Self::idct(&i, true).to_kind(x.kind()));
+                self.b_dict
+                    .insert(n2, Self::idct(&i, true).to_kind(x.kind()));
             }
             let n1w = self.b_dict.get(&n1).unwrap().to_device(device);
             let n2w = self.b_dict.get(&n2).unwrap().to_device(device);
@@ -379,7 +465,8 @@ impl TransformDCT {
 
             if !self.b_dict.contains_key(&n1) {
                 let i = Tensor::eye(n1, (Kind::Float, device));
-                self.b_dict.insert(n1, Self::idct(&i, true).to_kind(x.kind()));
+                self.b_dict
+                    .insert(n1, Self::idct(&i, true).to_kind(x.kind()));
             }
             let n1w = self.b_dict.get(&n1).unwrap().to_device(device);
             self.b_dict.insert(n1, n1w.copy());
@@ -744,11 +831,7 @@ impl Distro {
                 );
 
                 let decoded = self.transform.decode(&decompressed);
-                let aligned = match align_matformer_prefix_grad(
-                    var.name(),
-                    &full_shape,
-                    decoded,
-                ) {
+                let aligned = match align_matformer_prefix_grad(var.name(), &full_shape, decoded) {
                     Ok(tensor) => tensor,
                     Err(err) => {
                         warn!(
@@ -777,21 +860,18 @@ impl Distro {
                         device,
                     );
                     let decoded = self.transform.decode(&decompressed);
-                    let aligned = match align_matformer_prefix_grad(
-                        var.name(),
-                        &full_shape,
-                        decoded,
-                    ) {
-                        Ok(tensor) => tensor,
-                        Err(err) => {
-                            warn!(
-                                parameter = var.name(),
-                                full_shape = ?full_shape,
-                                "Skipping incompatible grad shape in DisTrO apply: {err:?}"
-                            );
-                            continue;
-                        }
-                    };
+                    let aligned =
+                        match align_matformer_prefix_grad(var.name(), &full_shape, decoded) {
+                            Ok(tensor) => tensor,
+                            Err(err) => {
+                                warn!(
+                                    parameter = var.name(),
+                                    full_shape = ?full_shape,
+                                    "Skipping incompatible grad shape in DisTrO apply: {err:?}"
+                                );
+                                continue;
+                            }
+                        };
                     combined = Some(match combined {
                         Some(acc) => acc + aligned,
                         None => aligned,
@@ -856,7 +936,7 @@ unsafe impl Send for Distro {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Variable, set_torch_rng_seed};
+    use crate::{set_torch_rng_seed, Variable};
     use itertools::iproduct;
 
     impl Variable for Tensor {
@@ -1164,12 +1244,9 @@ mod tests {
     fn test_align_matformer_prefix_grad_expand_gate() {
         let grad = _2d_float(&[[1.0, 2.0], [3.0, 4.0]]);
         let full_shape = vec![4i64, 2i64];
-        let aligned = align_matformer_prefix_grad(
-            "model.layers.0.mlp.gate_proj.weight",
-            &full_shape,
-            grad,
-        )
-        .unwrap();
+        let aligned =
+            align_matformer_prefix_grad("model.layers.0.mlp.gate_proj.weight", &full_shape, grad)
+                .unwrap();
         assert_eq!(aligned.size(), full_shape);
         let prefix = aligned.narrow(0, 0, 2);
         let tail = aligned.narrow(0, 2, 2);
@@ -1179,17 +1256,11 @@ mod tests {
 
     #[test]
     fn test_align_matformer_prefix_grad_slice_down() {
-        let grad = _2d_float(&[
-            [1.0, 2.0, 3.0, 4.0],
-            [5.0, 6.0, 7.0, 8.0],
-        ]);
+        let grad = _2d_float(&[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
         let full_shape = vec![2i64, 2i64];
-        let aligned = align_matformer_prefix_grad(
-            "model.layers.0.mlp.down_proj.weight",
-            &full_shape,
-            grad,
-        )
-        .unwrap();
+        let aligned =
+            align_matformer_prefix_grad("model.layers.0.mlp.down_proj.weight", &full_shape, grad)
+                .unwrap();
         assert_eq!(aligned.size(), full_shape);
         assert!(aligned.allclose(&_2d_float(&[[1.0, 2.0], [5.0, 6.0]]), 1e-6, 1e-6, false));
     }
@@ -1330,6 +1401,126 @@ mod tests {
         let unquant = Distro::unpack_tensor_sign_from_boolean(quant, input.kind());
 
         assert!(input.sign().equal(&unquant));
+    }
+
+    #[test]
+    fn test_extract_layer_index() {
+        assert_eq!(
+            extract_layer_index("model.layers.0.mlp.gate_proj.weight"),
+            Some(0)
+        );
+        assert_eq!(
+            extract_layer_index("model.layers.5.mlp.down_proj.weight"),
+            Some(5)
+        );
+        assert_eq!(
+            extract_layer_index("model.layers.12.self_attn.q_proj.weight"),
+            Some(12)
+        );
+        assert_eq!(extract_layer_index("model.embed_tokens.weight"), None);
+        assert_eq!(extract_layer_index("lm_head.weight"), None);
+    }
+
+    #[test]
+    fn test_align_matformer_sparse_grad_gate_proj() {
+        // Test scattering sparse gradients for gate_proj
+        // Simulates prefix [0,1] + helper indices [4,6]
+        let grad = _2d_float(&[
+            [1.0, 2.0], // idx 0
+            [3.0, 4.0], // idx 1
+            [5.0, 6.0], // idx 4
+            [7.0, 8.0], // idx 6
+        ]);
+        let full_shape = vec![8i64, 2i64];
+        let indices: Vec<i64> = vec![0, 1, 4, 6];
+
+        let aligned = align_matformer_sparse_grad(
+            "model.layers.0.mlp.gate_proj.weight",
+            &full_shape,
+            grad,
+            &indices,
+        )
+        .unwrap();
+
+        assert_eq!(aligned.size(), full_shape);
+
+        // Check row 0
+        let row0 = aligned.narrow(0, 0, 1);
+        assert!(row0.allclose(&_2d_float(&[[1.0, 2.0]]), 1e-6, 1e-6, false));
+
+        // Check row 1
+        let row1 = aligned.narrow(0, 1, 1);
+        assert!(row1.allclose(&_2d_float(&[[3.0, 4.0]]), 1e-6, 1e-6, false));
+
+        // Check rows 2,3 are zeros
+        let row2 = aligned.narrow(0, 2, 1);
+        let row3 = aligned.narrow(0, 3, 1);
+        assert!(row2.allclose(&_2d_float(&[[0.0, 0.0]]), 1e-6, 1e-6, false));
+        assert!(row3.allclose(&_2d_float(&[[0.0, 0.0]]), 1e-6, 1e-6, false));
+
+        // Check row 4
+        let row4 = aligned.narrow(0, 4, 1);
+        assert!(row4.allclose(&_2d_float(&[[5.0, 6.0]]), 1e-6, 1e-6, false));
+
+        // Check row 5 is zeros
+        let row5 = aligned.narrow(0, 5, 1);
+        assert!(row5.allclose(&_2d_float(&[[0.0, 0.0]]), 1e-6, 1e-6, false));
+
+        // Check row 6
+        let row6 = aligned.narrow(0, 6, 1);
+        assert!(row6.allclose(&_2d_float(&[[7.0, 8.0]]), 1e-6, 1e-6, false));
+    }
+
+    #[test]
+    fn test_align_matformer_sparse_grad_down_proj() {
+        // Test scattering sparse gradients for down_proj (columns)
+        // Simulates prefix [0,1] + helper indices [4,6]
+        let grad = _2d_float(&[
+            [1.0, 2.0, 5.0, 7.0], // row 0, cols [0,1,4,6]
+            [3.0, 4.0, 6.0, 8.0], // row 1, cols [0,1,4,6]
+        ]);
+        let full_shape = vec![2i64, 8i64];
+        let indices: Vec<i64> = vec![0, 1, 4, 6];
+
+        let aligned = align_matformer_sparse_grad(
+            "model.layers.0.mlp.down_proj.weight",
+            &full_shape,
+            grad,
+            &indices,
+        )
+        .unwrap();
+
+        assert_eq!(aligned.size(), full_shape);
+
+        // Check columns 0,1,4,6 have values, others are zeros
+        let col0 = aligned.narrow(1, 0, 1);
+        assert!(col0.allclose(&_2d_float(&[[1.0], [3.0]]), 1e-6, 1e-6, false));
+
+        let col4 = aligned.narrow(1, 4, 1);
+        assert!(col4.allclose(&_2d_float(&[[5.0], [6.0]]), 1e-6, 1e-6, false));
+
+        let col2 = aligned.narrow(1, 2, 1);
+        assert!(col2.allclose(&_2d_float(&[[0.0], [0.0]]), 1e-6, 1e-6, false));
+    }
+
+    #[test]
+    fn test_align_matformer_sparse_grad_rejects_non_mlp() {
+        let grad = _2d_float(&[[1.0, 2.0]]);
+        let full_shape = vec![2i64, 2i64];
+        let indices: Vec<i64> = vec![0];
+        let err = align_matformer_sparse_grad(
+            "model.layers.0.self_attn.q_proj.weight",
+            &full_shape,
+            grad,
+            &indices,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PrefixAlignError::UnsupportedParameter(
+                "model.layers.0.self_attn.q_proj.weight".to_string()
+            )
+        );
     }
 }
 
