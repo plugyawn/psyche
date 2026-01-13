@@ -169,9 +169,10 @@ fn canonicalize_config_for_schema(
                 }
             }
         }
-        if obj.contains_key("matformer_tier") {
-            obj.insert("matformer_tier".to_string(), serde_json::Value::from(0));
-        }
+        // ALWAYS set matformer_tier to 0 for canonical comparison
+        // This ensures full checkpoints (no field) and sliced checkpoints (field=0)
+        // produce the same hash for heterogeneous tier training
+        obj.insert("matformer_tier".to_string(), serde_json::Value::from(0));
     }
     config
 }
