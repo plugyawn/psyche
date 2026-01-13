@@ -25,6 +25,10 @@ pub struct RoPEConfig {
     pub beta_slow: Option<f32>,
     pub mscale: Option<f32>,
     pub mscale_all_dim: Option<f32>,
+    /// Half-truncate mode: first quarter of dimensions use varying frequencies,
+    /// second quarter gets zeros. Used by modded-nanogpt.
+    #[serde(default)]
+    pub half_truncate: bool,
 }
 
 pub fn default_rope() -> f32 {
@@ -91,18 +95,12 @@ impl RoPECache {
         rope_theta: f32,
         device: &Device,
     ) -> Self {
-        Self::new_with_options(rope_config, head_dim, rope_theta, device, false)
-    }
+        // Read half_truncate from config if present
+        let half_truncate = rope_config
+            .as_ref()
+            .map(|c| c.half_truncate)
+            .unwrap_or(false);
 
-    /// Create RoPE cache with optional half-truncate mode.
-    /// Half-truncate: first quarter of dimensions use varying frequencies, second quarter gets zeros.
-    pub fn new_with_options(
-        rope_config: &Option<RoPEConfig>,
-        head_dim: usize,
-        rope_theta: f32,
-        device: &Device,
-        half_truncate: bool,
-    ) -> Self {
         let inv_freq = if half_truncate {
             // Half-truncate: only first quarter varies, second quarter is zeros
             // Normal RoPE has head_dim/2 frequency pairs
