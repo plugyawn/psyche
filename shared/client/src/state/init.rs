@@ -87,6 +87,80 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub sidecar_port: Option<u16>,
 }
 
+/// Print MatFormer configuration summary with ASCII art header.
+/// Called after model loading to provide clear visibility into tier configuration.
+fn print_matformer_summary(
+    checkpoint_path: &str,
+    cli_tier: u8,
+    effective_tier: u8,
+    uses_sliced_checkpoint: bool,
+    load_strategy: &MatformerLoadStrategy,
+    helper_fraction: f32,
+    intermediate_size: u64,
+    active_intermediate_size: u64,
+) {
+    let helper_status = if helper_fraction > 0.0 {
+        if uses_sliced_checkpoint {
+            "Auto-disabled (sliced checkpoint)"
+        } else {
+            "Enabled"
+        }
+    } else {
+        "Disabled"
+    };
+
+    let tier_match = if cli_tier == effective_tier { "✓" } else { "≠" };
+    let capacity_pct = (active_intermediate_size * 100) / intermediate_size;
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════════╗");
+    eprintln!("║                      MATFORMER CONFIGURATION                     ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Checkpoint:       {:<45} ║", truncate_path(checkpoint_path, 45));
+    eprintln!("║  Load strategy:    {:<45} ║", format!("{:?}", load_strategy));
+    eprintln!("║  Sliced checkpoint: {:<44} ║", if uses_sliced_checkpoint { "Yes" } else { "No" });
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+    eprintln!("║  CLI tier:         {:<45} ║", cli_tier);
+    eprintln!("║  Effective tier:   {:<45} ║", format!("{} {}", effective_tier, tier_match));
+    eprintln!("║  Helper mode:      {:<45} ║", helper_status);
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+    eprintln!("║  FFN width:        {:<45} ║", format!("{} / {} ({}%)", active_intermediate_size, intermediate_size, capacity_pct));
+    eprintln!("╚══════════════════════════════════════════════════════════════════╝");
+
+    // Validation warnings
+    if cli_tier != effective_tier {
+        eprintln!();
+        eprintln!("[WARNING] CLI tier ({}) differs from effective tier ({})", cli_tier, effective_tier);
+        if uses_sliced_checkpoint {
+            eprintln!("          Sliced checkpoint detected - using tier 0 to avoid double-slicing.");
+            eprintln!("          This is expected behavior for pre-truncated checkpoints.");
+        }
+    }
+
+    if helper_fraction > 0.0 && uses_sliced_checkpoint {
+        eprintln!();
+        eprintln!("[INFO] Helper mode requested but auto-disabled for sliced checkpoint.");
+        eprintln!("       Sliced checkpoints have no suffix neurons to sample from.");
+    }
+
+    if helper_fraction > 0.0 && cli_tier > 0 && !uses_sliced_checkpoint {
+        eprintln!();
+        eprintln!("[WARNING] Helper mode with tier > 0 on full checkpoint.");
+        eprintln!("          This is an advanced configuration. Ensure gradients align correctly.");
+    }
+
+    eprintln!();
+}
+
+/// Truncate a path string to fit within max_len, adding "..." prefix if needed.
+fn truncate_path(path: &str, max_len: usize) -> String {
+    if path.len() <= max_len {
+        path.to_string()
+    } else {
+        format!("...{}", &path[path.len() - (max_len - 3)..])
+    }
+}
+
 async fn resolve_matformer_local_repo_path(
     base: &Path,
     tier: u8,
@@ -897,6 +971,18 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                     num_hidden_layers = num_hidden_layers.unwrap_or_default(),
                                     vocab_size = vocab_size.unwrap_or_default(),
                                     "loaded_model",
+                                );
+
+                                // Print MatFormer configuration summary
+                                print_matformer_summary(
+                                    matformer_checkpoint_path.as_deref().unwrap_or("unknown"),
+                                    init_config.matformer_tier,
+                                    matformer_tier_for_loading,
+                                    uses_sliced_checkpoint,
+                                    &init_config.matformer_load_strategy,
+                                    init_config.matformer_helper_fraction,
+                                    intermediate_size,
+                                    active_intermediate_size,
                                 );
                             }
                             _ => {

@@ -1,0 +1,209 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Psyche is a distributed training system for transformer-based AI models over the internet. It enables collaboration between untrusted parties to train ML models using two deployment architectures:
+
+- **Centralized**: Server-coordinated training via `architectures/centralized/`
+- **Decentralized**: Solana blockchain-coordinated training via `architectures/decentralized/`
+
+## Build Commands
+
+```bash
+# Enter nix development shell (recommended)
+nix develop
+
+# Build all workspace crates
+cargo build
+
+# Build with release optimizations
+cargo build --release
+
+# Format and lint
+nix fmt  # or: cargo clippy --fix --allow-staged --all-targets && cargo fmt
+
+# Build Solana programs (requires anchor)
+cd architectures/decentralized/solana-coordinator && anchor build
+cd architectures/decentralized/solana-authorizer && anchor build
+```
+
+## Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run a single test
+cargo test --release -p <package-name> -- --nocapture <test_name>
+
+# Centralized integration tests
+just integration-test                    # all tests
+just integration-test <test_name>        # single test
+
+# Decentralized integration tests
+just decentralized-integration-tests                    # without Python
+USE_PYTHON=1 just decentralized-integration-tests      # with Python
+
+# Solana client tests
+cargo test --package psyche-solana-client --features solana-localnet-tests
+```
+
+## Local Development
+
+```bash
+# Start a local centralized testnet (requires tmux)
+just local-testnet
+
+# Headless smoke test
+cargo run -p psyche-centralized-local-testnet -- start --headless --headless-exit-after-secs 10 --num-clients 2 --config-path ./config/test --tui false
+
+# Local Solana testnet setup
+just setup-solana-localnet-test-run
+just start-training-localnet-client
+
+# Start local telemetry stack (Grafana/Prometheus/Loki)
+docker compose -f telemetry/docker-compose.yml up
+```
+
+## Architecture
+
+### Shared Crates (`shared/`)
+
+Core functionality shared between centralized and decentralized architectures:
+
+- **`psyche-core`**: Core types and primitives (batch IDs, hashes, config)
+- **`psyche-coordinator`**: Coordinator state machine, committee selection, data assignment logic
+- **`psyche-client`**: Training client implementation (model loading, training loop, checkpointing)
+- **`psyche-modeling`**: PyTorch/tch-rs model implementations (LLaMA, attention, trainer)
+- **`psyche-network`**: P2P networking via iroh (gossip, blob transfer)
+- **`psyche-data-provider`**: Dataset loading (HuggingFace, local, parquet, GCS)
+- **`psyche-eval`**: Evaluation utilities
+- **`psyche-watcher`**: Run state observation abstractions
+- **`psyche-tui`**: Terminal UI components
+- **`psyche-metrics`**: OpenTelemetry metrics collection
+
+### Centralized (`architectures/centralized/`)
+
+- **`server`**: Coordinates rounds, assigns batches, collects witnesses
+- **`client`**: Trains batches, submits gradients/witnesses
+- **`local-testnet`**: Automated multi-client testing with tmux
+
+### Decentralized (`architectures/decentralized/`)
+
+Solana-based coordination:
+- **`solana-coordinator`**: Anchor program for run coordination
+- **`solana-authorizer`**: Access control program
+- **`solana-treasurer`**: Token/reward management
+- **`solana-client`**: Client for Solana-coordinated training
+
+### Python Integration (`python/`)
+
+PyO3-based Python bindings for using Python models within the Rust training loop. Enable with `--features python`.
+
+## Configuration
+
+Training runs are configured via TOML files in `config/`:
+- `state.toml`: Run configuration (batch sizes, round timing, model config)
+- Model configs specify: architecture, data location, optimizer, LR schedule
+
+Example minimal config structure:
+```toml
+run_id = "test"
+run_state = "WaitingForMembers"
+[config]
+min_clients = 2
+global_batch_size_start = 4
+# ...
+[model.LLM]
+architecture = "HfLlama"
+# ...
+```
+
+## Key Features
+
+- **MatFormer Support**: Heterogeneous training with different FFN widths per client (`--matformer-tier`)
+- **Device Support**: CUDA, MPS (macOS Metal), CPU via `--device`
+- **Data Parallelism**: Multi-GPU via NCCL (`--features parallelism`)
+- **Checkpointing**: HuggingFace Hub integration for model saving/loading
+
+## MatFormer Heterogeneous Training Status
+
+**CURRENT STATUS: PRODUCTION-READY** (with helper mode disabled for tier > 0)
+
+Mixed-tier training (clients with different `--matformer-tier` values) works correctly. Earlier analysis incorrectly identified several "issues" that are actually expected behavior.
+
+### How It Works
+
+Each client trains on **different, non-overlapping batches** within a round:
+- Tier-0 clients: Train with full FFN width, contribute gradients for all neurons
+- Tier-1 clients: Train with half FFN width, contribute gradients for prefix neurons only
+
+This creates **sample rate asymmetry**:
+- Prefix neurons: See gradients from ALL tiers (higher effective sample rate)
+- Suffix neurons: See gradients from tier-0 only (lower effective sample rate)
+- Over pretraining-scale data, both regions see the full data distribution
+
+### Why This Is Mathematically Sound
+
+1. **Backprop is cleanly separable** - Each client's forward/backward pass is independent
+2. **No cross-contamination** - Tier-1's zeros in suffix positions don't dilute tier-0's gradients
+3. **Sign-SGD makes magnitude irrelevant** - Only gradient direction matters, not scale
+4. **Witnesses verify blob hashes** - Commitment verification uses downloaded blob's xshape, not local model
+
+### Recommended Configuration
+
+```bash
+# Heterogeneous training (WORKS)
+--client-matformer-tiers 0,1,1 \
+--client-matformer-helper-fractions 0,0,0  # Required: disable helper mode for tier > 0
+```
+
+### Startup Summary
+
+On model load, a MatFormer configuration summary is printed:
+```
+╔══════════════════════════════════════════════════════════════════╗
+║                      MATFORMER CONFIGURATION                     ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Checkpoint:       ./checkpoints/nanogpt-20m-init-tier1          ║
+║  Load strategy:    Auto                                          ║
+║  Sliced checkpoint: Yes                                          ║
+╠══════════════════════════════════════════════════════════════════╣
+║  CLI tier:         1                                             ║
+║  Effective tier:   0 ≠                                           ║
+║  Helper mode:      Auto-disabled (sliced checkpoint)             ║
+╠══════════════════════════════════════════════════════════════════╣
+║  FFN width:        512 / 512 (100%)                              ║
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+Includes contextual warnings for tier mismatches and helper mode configuration.
+
+### Known Limitations
+
+| Issue | Status | Mitigation |
+|-------|--------|------------|
+| Helper mode + sliced checkpoint | Auto-disabled | Code correctly detects and disables |
+| Checkpoint tier metadata | Warning on load | Startup summary shows tier mismatch |
+| Memory savings (small models) | ~15%, not 50% | Embeddings dominate; larger models save more |
+
+### Testing Heterogeneous Training
+
+```bash
+# Run heterogeneous training
+DYLD_LIBRARY_PATH=./.venv/lib/python3.12/site-packages/torch/lib \
+  cargo run --release -p psyche-centralized-local-testnet -- start \
+    --headless --headless-exit-after-secs 60 --num-clients 3 \
+    --config-path ./config/nanogpt-20m-run \
+    --client-matformer-tiers 0,1,1 \
+    --client-matformer-helper-fractions 0,0,0 \
+    --tui false
+```
+
+See full technical analysis: `~/.claude/plans/enumerated-scribbling-graham.md`
+
+## Cargo Configuration
+
+Uses `tokio_unstable` feature flag (see `.cargo/config.toml`). The workspace uses a local cargo home (`.cargo-home/`) and target directories (`.cargo-target/`, `.cargo-target-tests/`).
