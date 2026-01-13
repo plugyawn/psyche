@@ -148,6 +148,14 @@ struct StartArgs {
 
     #[clap(long, env)]
     eval_tasks: Option<String>,
+
+    /// Directory to save model checkpoints locally (passed to all clients).
+    #[clap(long)]
+    client_checkpoint_dir: Option<PathBuf>,
+
+    /// Number of checkpoint steps to keep (default: 3).
+    #[clap(long, default_value_t = 3)]
+    client_keep_steps: u32,
 }
 
 fn validate_num_clients(s: &str) -> Result<usize> {
@@ -222,16 +230,16 @@ fn main() -> Result<()> {
                 start_args.headless = true;
             }
 
-            // Pre-build packages
+            // Pre-build packages in release mode for libtorch compatibility
             Command::new("cargo")
-                .args(["build", "-p", "psyche-centralized-server"])
+                .args(["build", "--release", "-p", "psyche-centralized-server"])
                 .status()
                 .ok()
                 .and_then(|s| s.success().then_some(()))
                 .expect("Failed to build server");
 
             Command::new("cargo")
-                .args(["build", "-p", "psyche-centralized-client"])
+                .args(["build", "--release", "-p", "psyche-centralized-client"])
                 .status()
                 .ok()
                 .and_then(|s| s.success().then_some(()))
@@ -240,6 +248,7 @@ fn main() -> Result<()> {
             let validate_cmd = if data_path.exists() {
                 vec![
                     "run",
+                    "--release",
                     "-p",
                     "psyche-centralized-server",
                     "validate-config",
@@ -251,6 +260,7 @@ fn main() -> Result<()> {
             } else {
                 vec![
                     "run",
+                    "--release",
                     "-p",
                     "psyche-centralized-server",
                     "validate-config",
@@ -259,8 +269,15 @@ fn main() -> Result<()> {
                 ]
             };
             // Validate config
-            Command::new("cargo")
-                .args(validate_cmd)
+            let mut validate_cmd_builder = Command::new("cargo");
+            validate_cmd_builder.args(validate_cmd);
+
+            // Propagate DYLD_LIBRARY_PATH for torch library loading on macOS
+            if let Ok(dyld_path) = std::env::var("DYLD_LIBRARY_PATH") {
+                validate_cmd_builder.env("DYLD_LIBRARY_PATH", dyld_path);
+            }
+
+            validate_cmd_builder
                 .status()
                 .ok()
                 .and_then(|s| s.success().then_some(()))
@@ -507,17 +524,17 @@ fn run_headless(args: &StartArgs, state_path: &PathBuf, data_path: &PathBuf, run
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root.join("target"));
 
-    let server_bin = target_dir.join("debug").join("psyche-centralized-server");
-    let client_bin = target_dir.join("debug").join("psyche-centralized-client");
+    let server_bin = target_dir.join("release").join("psyche-centralized-server");
+    let client_bin = target_dir.join("release").join("psyche-centralized-client");
     if !server_bin.exists() {
         bail!(
-            "Server binary not found at {} (did `cargo build -p psyche-centralized-server` succeed?)",
+            "Server binary not found at {} (did `cargo build --release -p psyche-centralized-server` succeed?)",
             server_bin.display()
         );
     }
     if !client_bin.exists() {
         bail!(
-            "Client binary not found at {} (did `cargo build -p psyche-centralized-client` succeed?)",
+            "Client binary not found at {} (did `cargo build --release -p psyche-centralized-client` succeed?)",
             client_bin.display()
         );
     }
@@ -528,8 +545,14 @@ fn run_headless(args: &StartArgs, state_path: &PathBuf, data_path: &PathBuf, run
     // Start server
     let mut server_cmd = Command::new(&server_bin);
     server_cmd
-        .env("RUST_LOG", &args.log)
-        .args([
+        .env("RUST_LOG", &args.log);
+
+    // Propagate DYLD_LIBRARY_PATH for torch library loading on macOS
+    if let Ok(dyld_path) = std::env::var("DYLD_LIBRARY_PATH") {
+        server_cmd.env("DYLD_LIBRARY_PATH", dyld_path);
+    }
+
+    server_cmd.args([
             "run",
             "--state",
             state_path.to_str().unwrap(),
@@ -652,7 +675,14 @@ fn spawn_client_headless(
     cmd.env("METRICS_LOCAL_PORT", metrics_local_port.to_string())
         .env("RUST_LOG", &args.log)
         .env("RUST_BACKTRACE", "1")
-        .env("RAW_IDENTITY_SECRET_KEY", raw_key)
+        .env("RAW_IDENTITY_SECRET_KEY", raw_key);
+
+    // Propagate DYLD_LIBRARY_PATH for torch library loading on macOS
+    if let Ok(dyld_path) = std::env::var("DYLD_LIBRARY_PATH") {
+        cmd.env("DYLD_LIBRARY_PATH", dyld_path);
+    }
+
+    cmd
         .args([
             "train",
             "--run-id",
@@ -720,6 +750,11 @@ fn spawn_client_headless(
 
     if let Some(evals) = &args.eval_tasks {
         cmd.args(["--eval-tasks", evals]);
+    }
+
+    if let Some(dir) = &args.client_checkpoint_dir {
+        cmd.args(["--checkpoint-dir", dir.to_str().unwrap()]);
+        cmd.args(["--keep-steps", &args.client_keep_steps.to_string()]);
     }
 
     println!("starting client {i}: {cmd:?}");
@@ -838,6 +873,10 @@ fn start_client(
 
     if let Some(evals) = &args.eval_tasks {
         cmd.push(format!(" --eval-tasks {evals}"))
+    }
+
+    if let Some(dir) = &args.client_checkpoint_dir {
+        cmd.push(format!(" --checkpoint-dir {} --keep-steps {}", dir.display(), args.client_keep_steps));
     }
 
     if print {
