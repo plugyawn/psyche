@@ -181,12 +181,22 @@ On model load, a MatFormer configuration summary is printed:
 
 Includes contextual warnings for tier mismatches and helper mode configuration.
 
+### Checkpoint Tier Management
+
+Checkpoints now store MatFormer tier metadata:
+- `matformer_tier`: The effective tier used during training
+- `matformer_base_intermediate_size`: Original FFN width before slicing
+
+This enables:
+- **Auto-inference**: Tier can be inferred from stored metadata or size ratio
+- **Double-slicing protection**: Error if attempting to further slice a sliced checkpoint with `--matformer-load-strategy universal`
+
 ### Known Limitations
 
 | Issue | Status | Mitigation |
 |-------|--------|------------|
 | Helper mode + sliced checkpoint | Auto-disabled | Code correctly detects and disables |
-| Checkpoint tier metadata | Warning on load | Startup summary shows tier mismatch |
+| Double-slicing | Hard error | `validate_no_double_slicing()` prevents misconfiguration |
 | Memory savings (small models) | ~15%, not 50% | Embeddings dominate; larger models save more |
 
 ### Testing Heterogeneous Training
