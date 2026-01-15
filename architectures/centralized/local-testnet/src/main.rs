@@ -143,6 +143,18 @@ struct StartArgs {
     #[clap(long, env)]
     wandb_entity: Option<String>,
 
+    /// Enable WandB step-level logging (every training step, not just rounds)
+    #[clap(long, env, default_value_t = false)]
+    wandb_step_logging: bool,
+
+    /// Enable WandB system metrics logging (GPU usage, memory, temperature)
+    #[clap(long, env, default_value_t = false)]
+    wandb_system_metrics: bool,
+
+    /// WandB system metrics logging interval in seconds
+    #[clap(long, env, default_value_t = 10)]
+    wandb_system_metrics_interval_secs: u64,
+
     #[clap(long, env)]
     optim_stats: Option<u32>,
 
@@ -156,6 +168,24 @@ struct StartArgs {
     /// Number of checkpoint steps to keep (default: 3).
     #[clap(long, default_value_t = 3)]
     client_keep_steps: u32,
+
+    /// Inject network latency for stress testing. Format: "base_ms" or "base_ms-jitter_ms"
+    /// Example: "50" = 50ms fixed, "50-20" = 50ms +/- 20ms uniform jitter
+    #[clap(long, env)]
+    fault_latency_ms: Option<String>,
+
+    /// Packet loss probability for stress testing (0.0 to 1.0)
+    /// Example: 0.1 = 10% packet loss
+    #[clap(long, env)]
+    fault_packet_loss: Option<f64>,
+
+    /// Bandwidth limit in bytes per second for stress testing
+    #[clap(long, env)]
+    fault_bandwidth_limit: Option<u64>,
+
+    /// Random seed for fault injection (for reproducibility)
+    #[clap(long, env)]
+    fault_seed: Option<u64>,
 }
 
 fn validate_num_clients(s: &str) -> Result<usize> {
@@ -730,6 +760,16 @@ fn spawn_client_headless(
     if let Some(project) = &args.wandb_project {
         cmd.args(["--wandb-project", project]);
     }
+    if args.wandb_step_logging {
+        cmd.arg("--wandb-step-logging");
+    }
+    if args.wandb_system_metrics {
+        cmd.arg("--wandb-system-metrics");
+        cmd.args([
+            "--wandb-system-metrics-interval-secs",
+            &args.wandb_system_metrics_interval_secs.to_string(),
+        ]);
+    }
 
     if args.write_log {
         let log_dir = format!(
@@ -755,6 +795,21 @@ fn spawn_client_headless(
     if let Some(dir) = &args.client_checkpoint_dir {
         cmd.args(["--checkpoint-dir", dir.to_str().unwrap()]);
         cmd.args(["--keep-steps", &args.client_keep_steps.to_string()]);
+    }
+
+    // Fault injection flags
+    if let Some(latency) = &args.fault_latency_ms {
+        cmd.args(["--fault-latency-ms", latency]);
+    }
+    if let Some(loss) = args.fault_packet_loss {
+        cmd.args(["--fault-packet-loss", &loss.to_string()]);
+    }
+    if let Some(limit) = args.fault_bandwidth_limit {
+        cmd.args(["--fault-bandwidth-limit", &limit.to_string()]);
+    }
+    if let Some(seed) = args.fault_seed {
+        // Use different seed per client for varied behavior, but deterministic
+        cmd.args(["--fault-seed", &(seed + i as u64).to_string()]);
     }
 
     println!("starting client {i}: {cmd:?}");
@@ -853,6 +908,15 @@ fn start_client(
     if let Some(project) = &args.wandb_project {
         cmd.push(format!(" --wandb-project {project}"));
     }
+    if args.wandb_step_logging {
+        cmd.push(" --wandb-step-logging".to_string());
+    }
+    if args.wandb_system_metrics {
+        cmd.push(format!(
+            " --wandb-system-metrics --wandb-system-metrics-interval-secs {}",
+            args.wandb_system_metrics_interval_secs
+        ));
+    }
 
     if args.write_log {
         let log_dir = format!(
@@ -877,6 +941,21 @@ fn start_client(
 
     if let Some(dir) = &args.client_checkpoint_dir {
         cmd.push(format!(" --checkpoint-dir {} --keep-steps {}", dir.display(), args.client_keep_steps));
+    }
+
+    // Fault injection flags
+    if let Some(latency) = &args.fault_latency_ms {
+        cmd.push(format!(" --fault-latency-ms {latency}"));
+    }
+    if let Some(loss) = args.fault_packet_loss {
+        cmd.push(format!(" --fault-packet-loss {loss}"));
+    }
+    if let Some(limit) = args.fault_bandwidth_limit {
+        cmd.push(format!(" --fault-bandwidth-limit {limit}"));
+    }
+    if let Some(seed) = args.fault_seed {
+        // Use different seed per client for varied behavior, but deterministic
+        cmd.push(format!(" --fault-seed {}", seed + i as u64));
     }
 
     if print {

@@ -5,6 +5,7 @@ use clap::Args;
 use psyche_eval::tasktype_from_name;
 use psyche_modeling::Devices;
 use psyche_network::{DiscoveryMode, RelayKind, SecretKey};
+use psyche_network_fault_injection::{FaultConfig, FaultConfigBuilder};
 use psyche_tui::LogOutput;
 use std::{path::PathBuf, time::Duration};
 use clap::ValueEnum;
@@ -162,6 +163,36 @@ pub struct TrainArgs {
     #[clap(long, env)]
     pub wandb_entity: Option<String>,
 
+    /// Enable WandB step-level logging (every training step, not just rounds)
+    #[clap(long, env, default_value_t = false)]
+    pub wandb_step_logging: bool,
+
+    /// Enable WandB system metrics logging (GPU usage, memory, temperature)
+    #[clap(long, env, default_value_t = false)]
+    pub wandb_system_metrics: bool,
+
+    /// WandB system metrics logging interval in seconds
+    #[clap(long, env, default_value_t = 10)]
+    pub wandb_system_metrics_interval_secs: u64,
+
+    /// Inject network latency for stress testing. Format: "base_ms" or "base_ms-jitter_ms"
+    /// Example: "50" = 50ms fixed, "50-20" = 50ms +/- 20ms uniform jitter
+    #[clap(long, env)]
+    pub fault_latency_ms: Option<String>,
+
+    /// Packet loss probability for stress testing (0.0 to 1.0)
+    /// Example: 0.1 = 10% packet loss
+    #[clap(long, env)]
+    pub fault_packet_loss: Option<f64>,
+
+    /// Bandwidth limit in bytes per second for stress testing
+    #[clap(long, env)]
+    pub fault_bandwidth_limit: Option<u64>,
+
+    /// Random seed for fault injection (for reproducibility)
+    #[clap(long, env)]
+    pub fault_seed: Option<u64>,
+
     #[clap(long, env)]
     pub write_log: Option<PathBuf>,
 
@@ -244,6 +275,9 @@ impl TrainArgs {
                 entity: self.wandb_entity.clone(),
                 api_key: wandb_api_key,
                 group: self.wandb_group.clone(),
+                step_logging: self.wandb_step_logging,
+                system_metrics: self.wandb_system_metrics,
+                system_metrics_interval_secs: self.wandb_system_metrics_interval_secs,
             }),
             Err(_) => {
                 match self.wandb_entity.is_some()
@@ -326,6 +360,24 @@ impl TrainArgs {
             })
             .collect();
         result
+    }
+
+    /// Build fault injection configuration from CLI args.
+    ///
+    /// Returns None if no fault injection is configured.
+    pub fn fault_config(&self) -> Option<FaultConfig> {
+        let config = FaultConfigBuilder::new()
+            .latency(self.fault_latency_ms.clone())
+            .packet_loss(self.fault_packet_loss)
+            .bandwidth_limit(self.fault_bandwidth_limit)
+            .seed(self.fault_seed)
+            .build();
+
+        if let Some(ref cfg) = config {
+            cfg.log_summary();
+        }
+
+        config
     }
 }
 

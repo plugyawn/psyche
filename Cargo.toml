@@ -31,6 +31,7 @@ psyche-python-extension-impl = { path = "./python/extension-impl" }
 psyche-tui = { path = "./shared/tui" }
 psyche-watcher = { path = "./shared/watcher" }
 psyche-metrics = { path = "./shared/metrics" }
+psyche-network-fault-injection = { path = "./shared/network-fault-injection" }
 
 psyche-solana-client = { path = "./architectures/decentralized/solana-client" }
 psyche-solana-authorizer = { path = "./architectures/decentralized/solana-authorizer/programs/solana-authorizer" }
