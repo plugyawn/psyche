@@ -22,4 +22,7 @@ pub struct WandBInfo {
     pub group: Option<String>,
     pub entity: Option<String>,
     pub api_key: String,
+    pub step_logging: bool,
+    pub system_metrics: bool,
+    pub system_metrics_interval_secs: u64,
 }

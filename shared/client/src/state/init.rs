@@ -1112,6 +1112,23 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             },
         };
 
+        // Extract step logging config before wandb_info is consumed
+        let step_logging_enabled = init_config
+            .wandb_info
+            .as_ref()
+            .map(|info| info.step_logging)
+            .unwrap_or(false);
+        let system_metrics_enabled = init_config
+            .wandb_info
+            .as_ref()
+            .map(|info| info.system_metrics)
+            .unwrap_or(false);
+        let system_metrics_interval_secs = init_config
+            .wandb_info
+            .as_ref()
+            .map(|info| info.system_metrics_interval_secs)
+            .unwrap_or(10);
+
         let wandb_future: JoinHandle<Result<Option<wandb::Run>, wandb::ApiError>> = tokio::spawn({
             let run_id = String::from(&state.run_id);
             async move {
@@ -1287,14 +1304,23 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
         };
 
         let wandb_run = wandb_run.map_err(InitRunError::WandbThreadCrashed)??;
+        // Wrap in Arc for sharing between StatsLogger and TrainingStepMetadata
+        let wandb_run = wandb_run.map(Arc::new);
 
         let stats_logger = StatsLogger::new(
             tokenizer,
             model_task_runner.clone(),
             llm.lr_schedule,
-            wandb_run,
+            wandb_run.clone(),
             metrics,
         );
+
+        // Start system metrics logging if enabled
+        let _system_metrics_task = if system_metrics_enabled {
+            stats_logger.start_system_metrics_logging(system_metrics_interval_secs)
+        } else {
+            None
+        };
 
         let warmup = WarmupStepMetadata {
             model_task_runner: model_task_runner.clone(),
@@ -1311,6 +1337,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
 
             model_task_runner: model_task_runner.clone(),
             log_memory_usage: init_config.log_memory_usage,
+            step_logging_enabled,
+            wandb_run,
         };
 
         let witness = WitnessStepMetadata {

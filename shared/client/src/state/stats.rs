@@ -1,3 +1,5 @@
+use nvml_wrapper::Nvml;
+use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use psyche_coordinator::{
     Coordinator, MAX_TOKENS_TO_SEND, WitnessEvalResult, WitnessMetadata, model,
 };
@@ -6,8 +8,9 @@ use psyche_metrics::ClientMetrics;
 use psyche_modeling::Trainer;
 use psyche_network::P2PEndpointInfo;
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use sysinfo::System;
 use tokenizers::Tokenizer;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use wandb::{DataValue, LogData};
 
 use crate::state::evals::{EnumModelTask, PROMPT_TASK_NAME};
@@ -36,12 +39,12 @@ impl StatsLogger {
         tokenizer: Arc<Tokenizer>,
         model_task_runner: ModelTaskRunner,
         lr_schedule: LearningRateSchedule,
-        wandb_run: Option<wandb::Run>,
+        wandb_run: Option<Arc<wandb::Run>>,
         metrics: Arc<ClientMetrics>,
     ) -> Self {
         Self {
             tokenizer,
-            wandb_run: wandb_run.map(Arc::new),
+            wandb_run,
             losses: Vec::new(),
             step_durations: Default::default(),
             training_round_durations: Default::default(),
@@ -348,6 +351,116 @@ impl StatsLogger {
     fn confidence(&self, loss: f32) -> f32 {
         let max_entropy = (self.tokenizer.get_vocab_size(false) as f32).log2();
         1.0 - (loss / max_entropy)
+    }
+
+    /// Start a background task that logs system metrics (CPU, memory, GPU) to WandB
+    /// at the specified interval. Returns the task handle if WandB is configured.
+    pub fn start_system_metrics_logging(
+        &self,
+        interval_secs: u64,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let wandb_run = self.wandb_run.clone()?;
+
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+
+            // Try to initialize NVML for GPU metrics
+            let nvml = Nvml::init().ok();
+            if nvml.is_some() {
+                info!("[wandb system metrics] NVML initialized, GPU metrics enabled");
+            } else {
+                info!("[wandb system metrics] NVML not available, GPU metrics disabled");
+            }
+
+            let mut sys = System::new();
+
+            loop {
+                interval.tick().await;
+                let mut log_data = LogData::new();
+
+                // CPU metrics
+                sys.refresh_cpu_all();
+                let cpu_usage = sys.global_cpu_usage();
+                log_data.insert("system/cpu_usage_percent", cpu_usage as f64);
+
+                // Memory metrics
+                sys.refresh_memory();
+                log_data.insert("system/memory_used_bytes", sys.used_memory());
+                log_data.insert("system/memory_total_bytes", sys.total_memory());
+                let memory_percent = if sys.total_memory() > 0 {
+                    (sys.used_memory() as f64 / sys.total_memory() as f64) * 100.0
+                } else {
+                    0.0
+                };
+                log_data.insert("system/memory_usage_percent", memory_percent);
+
+                // GPU metrics (if NVML available)
+                if let Some(ref nvml) = nvml {
+                    if let Ok(device_count) = nvml.device_count() {
+                        for i in 0..device_count {
+                            if let Ok(gpu) = nvml.device_by_index(i) {
+                                if let Ok(util) = gpu.utilization_rates() {
+                                    log_data.insert(
+                                        format!("gpu/{i}/usage_percent"),
+                                        util.gpu as f64,
+                                    );
+                                    log_data.insert(
+                                        format!("gpu/{i}/memory_util_percent"),
+                                        util.memory as f64,
+                                    );
+                                }
+                                if let Ok(mem) = gpu.memory_info() {
+                                    log_data.insert(format!("gpu/{i}/memory_used_bytes"), mem.used);
+                                    log_data
+                                        .insert(format!("gpu/{i}/memory_total_bytes"), mem.total);
+                                    let gpu_mem_percent = if mem.total > 0 {
+                                        (mem.used as f64 / mem.total as f64) * 100.0
+                                    } else {
+                                        0.0
+                                    };
+                                    log_data.insert(
+                                        format!("gpu/{i}/memory_usage_percent"),
+                                        gpu_mem_percent,
+                                    );
+                                }
+                                if let Ok(temp) = gpu.temperature(TemperatureSensor::Gpu) {
+                                    log_data.insert(format!("gpu/{i}/temperature_c"), temp as u64);
+                                }
+                                // Power usage if available
+                                if let Ok(power) = gpu.power_usage() {
+                                    log_data.insert(
+                                        format!("gpu/{i}/power_watts"),
+                                        power as f64 / 1000.0,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                wandb_run.log(log_data).await;
+            }
+        }))
+    }
+
+    /// Log step-level loss to WandB (called per training step, not per round)
+    pub fn log_step_loss(&self, step: u32, batch_idx: usize, loss: f32) {
+        if let Some(run) = self.wandb_run.clone() {
+            let mut step_log = LogData::new();
+            step_log.insert("_step", step);
+            step_log.insert("step/batch_idx", batch_idx);
+            step_log.insert("step/loss", loss);
+            step_log.insert("step/perplexity", loss.exp());
+
+            tokio::spawn(async move {
+                run.log(step_log).await;
+            });
+        }
+    }
+
+    /// Check if step logging is supported (WandB is configured)
+    pub fn has_wandb(&self) -> bool {
+        self.wandb_run.is_some()
     }
 }
 

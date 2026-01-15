@@ -38,6 +38,7 @@ use super::{
     types::DistroBroadcastAndPayload,
 };
 use sysinfo::{Pid, ProcessesToUpdate, System, get_current_pid};
+use wandb::LogData;
 
 #[derive(Debug)]
 pub struct FinishedTrainers {
@@ -108,6 +109,11 @@ pub struct TrainingStepMetadata<T: NodeIdentity, A: AuthenticatableIdentity> {
 
     pub model_task_runner: ModelTaskRunner,
     pub log_memory_usage: bool,
+
+    /// Enable step-level loss logging to WandB (per batch, not per round)
+    pub step_logging_enabled: bool,
+    /// WandB run for step-level logging (if enabled)
+    pub wandb_run: Option<Arc<wandb::Run>>,
 }
 
 #[derive(Debug)]
@@ -318,6 +324,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                     },
                 };
                 let finished = finished.clone();
+                let step_logging_enabled = self.step_logging_enabled;
+                let wandb_run = self.wandb_run.clone();
 
                 let TrainingDataForStep {
                     step,
@@ -328,6 +336,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
 
                 tokio::task::spawn(async move {
                     let mut round_losses: Vec<f32> = Vec::new();
+                    let mut batch_idx: usize = 0;
                     let mut optim_stats: HashMap<String, f64> = HashMap::new();
 
                     let mut available_trainers =
@@ -493,6 +502,23 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                 res?;
 
                                 round_losses.push(loss);
+
+                                // Step-level logging to WandB if enabled
+                                if step_logging_enabled {
+                                    if let Some(ref run) = wandb_run {
+                                        let mut step_log = LogData::new();
+                                        step_log.insert("_step", step);
+                                        step_log.insert("step/batch_idx", batch_idx);
+                                        step_log.insert("step/loss", loss);
+                                        step_log.insert("step/perplexity", loss.exp());
+                                        let run = run.clone();
+                                        tokio::spawn(async move {
+                                            run.log(step_log).await;
+                                        });
+                                    }
+                                }
+                                batch_idx += 1;
+
                                 sent_results = true;
                             }
                         }
