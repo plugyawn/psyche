@@ -957,7 +957,6 @@ struct NanoGPTBlock {
     resid_lambda: Option<Tensor>,
     // Smear gate (1-token lookback mixing)
     smear_gate: Option<Tensor>,
-    layer_idx: usize,
 }
 
 impl NanoGPTBlock {
@@ -1022,7 +1021,6 @@ impl NanoGPTBlock {
             x0_lambda,
             resid_lambda,
             smear_gate,
-            layer_idx,
         }
     }
 
