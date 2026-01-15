@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod fetch_data;
+pub mod matformer;
 mod protocol;
 mod state;
 mod testing;
