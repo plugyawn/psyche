@@ -5,7 +5,7 @@ use tch::{COptimizer, Device, Kind, Tensor};
 use tracing::warn;
 
 #[derive(Debug, PartialEq, Eq)]
-enum PrefixAlignError {
+pub(crate) enum PrefixAlignError {
     UnsupportedParameter(String),
     RankMismatch { expected: usize, got: usize },
     ShapeMismatch { full: Vec<i64>, grad: Vec<i64> },
@@ -24,6 +24,7 @@ fn matformer_prefix_dim(name: &str) -> Option<usize> {
 /// Extract layer index from parameter name like "model.layers.5.mlp.gate_proj.weight"
 // TODO: Use this when helper-mode sparse indices are wired (map params -> layer for index lookup).
 // TODO: Remove if helper-mode sparse indices are dropped or moved elsewhere.
+#[allow(dead_code)]
 fn extract_layer_index(name: &str) -> Option<usize> {
     // Look for "layers.N" pattern
     let parts: Vec<&str> = name.split('.').collect();
@@ -50,6 +51,7 @@ fn extract_layer_index(name: &str) -> Option<usize> {
 ///
 /// # Returns
 /// Full-sized gradient tensor with values scattered to the correct positions
+#[allow(dead_code)]
 pub fn align_matformer_sparse_grad(
     name: &str,
     full_shape: &[i64],
