@@ -1,4 +1,4 @@
-use crate::HubUploadInfo;
+use crate::{HubUploadInfo, matformer::annotate_matformer_checkpoint_config};
 
 use psyche_coordinator::{
     Coordinator,
@@ -223,44 +223,10 @@ impl CooldownStepMetadata {
                             let mut config: serde_json::Value = serde_json::from_str(&content)
                                 .map_err(CheckpointError::ParseConfigJson)?;
 
-                            if let Some(obj) = config.as_object_mut() {
-                                let intermediate_size = obj
-                                    .get("intermediate_size")
-                                    .and_then(|v| v.as_u64());
-                                let base_size = matformer_info
-                                    .base_intermediate_size
-                                    .or_else(|| {
-                                        obj.get("matformer_base_intermediate_size")
-                                            .and_then(|v| v.as_u64())
-                                    })
-                                    .or(intermediate_size);
-
-                                let actual_tier = match (base_size, intermediate_size) {
-                                    (Some(base), Some(current))
-                                        if current > 0 && base >= current && base % current == 0 =>
-                                    {
-                                        let ratio = base / current;
-                                        if ratio.is_power_of_two() {
-                                            ratio.trailing_zeros() as u8
-                                        } else {
-                                            0
-                                        }
-                                    }
-                                    _ => 0,
-                                };
-
-                                obj.insert(
-                                    "matformer_tier".to_string(),
-                                    serde_json::Value::from(actual_tier),
-                                );
-
-                                if let Some(base_size) = base_size {
-                                    obj.insert(
-                                        "matformer_base_intermediate_size".to_string(),
-                                        serde_json::Value::from(base_size),
-                                    );
-                                }
-                            }
+                            annotate_matformer_checkpoint_config(
+                                &mut config,
+                                matformer_info.base_intermediate_size,
+                            );
 
                             let updated = serde_json::to_string_pretty(&config)
                                 .map_err(CheckpointError::ParseConfigJson)?;

@@ -1,4 +1,10 @@
-use crate::{IntegrationTestLogMarker, WandBInfo, fetch_data::DataFetcher};
+use crate::{
+    IntegrationTestLogMarker, WandBInfo, fetch_data::DataFetcher,
+    matformer::{
+        MATFORMER_MANIFEST_NAME, MatformerManifest, ensure_matformer_checkpoint_metadata,
+        infer_matformer_checkpoint_metadata,
+    },
+};
 use crate::cli::MatformerLoadStrategy;
 use psyche_coordinator::{
     Coordinator, HealthChecks,
@@ -8,7 +14,7 @@ use psyche_core::{Barrier, CancellableBarrier, NodeIdentity, Shuffle, TokenSize,
 use psyche_data_provider::{
     DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider,
     PreprocessedDataProvider, Split, WeightedDataProvider, download_dataset_repo_async,
-    download_model_repo_async,
+    download_model_repo_async, download_model_repo_files_async, list_model_repo_files_async,
     http::{FileURLs, HttpDataProvider},
 };
 use psyche_metrics::ClientMetrics;
@@ -22,8 +28,9 @@ use psyche_modeling::{
 use psyche_network::{AuthenticatableIdentity, BlobTicket};
 use psyche_watcher::{ModelSchemaInfo, OpportunisticData};
 use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 use tch::{Device, Kind, Tensor};
@@ -93,6 +100,8 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_apply_matformer_checkpoint_tier_overrides_auto() {
@@ -155,6 +164,229 @@ mod tests {
             true,
         )
         .is_ok());
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("psyche-{prefix}-{nanos}"));
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_resolve_local_manifest_tier() {
+        let base = temp_dir("matformer-manifest");
+        let tier_dir = base.with_file_name(format!(
+            "{}-tier1",
+            base.file_name().unwrap().to_string_lossy()
+        ));
+        let tier_name = tier_dir.file_name().unwrap().to_string_lossy().to_string();
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&tier_dir).unwrap();
+
+        std::fs::write(
+            base.join("config.json"),
+            r#"{"intermediate_size":1024,"matformer_tier":0,"matformer_base_intermediate_size":1024}"#,
+        )
+        .unwrap();
+        std::fs::write(base.join("model.safetensors"), b"").unwrap();
+        std::fs::write(
+            tier_dir.join("config.json"),
+            r#"{"intermediate_size":512,"matformer_tier":1,"matformer_base_intermediate_size":1024}"#,
+        )
+        .unwrap();
+        std::fs::write(tier_dir.join("model.safetensors"), b"").unwrap();
+
+        let manifest = json!({
+            "schema_version": 1,
+            "matformer_base_intermediate_size": 1024,
+            "common_files": [],
+            "tiers": [
+                {
+                    "tier": 1,
+                    "intermediate_size": 512,
+                    "files": [
+                        format!("../{tier_name}/config.json"),
+                        format!("../{tier_name}/model.safetensors")
+                    ]
+                }
+            ],
+            "sha256": {}
+        });
+        std::fs::write(
+            base.join(MATFORMER_MANIFEST_NAME),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_matformer_local_repo_files(&base, 1, MatformerLoadStrategy::Auto)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(resolved.uses_sliced_checkpoint);
+        assert_eq!(resolved.matformer_tier_for_loading, 0);
+        assert!(resolved
+            .repo_files
+            .iter()
+            .any(|path| path.ends_with("config.json")));
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&tier_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_local_manifest_missing_tier_sliced() {
+        let base = temp_dir("matformer-manifest-missing");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("config.json"),
+            r#"{"intermediate_size":1024,"matformer_tier":0,"matformer_base_intermediate_size":1024}"#,
+        )
+        .unwrap();
+        std::fs::write(base.join("model.safetensors"), b"").unwrap();
+
+        let manifest = json!({
+            "schema_version": 1,
+            "matformer_base_intermediate_size": 1024,
+            "common_files": [],
+            "tiers": [],
+            "sha256": {}
+        });
+        std::fs::write(
+            base.join(MATFORMER_MANIFEST_NAME),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err =
+            resolve_matformer_local_repo_files(&base, 1, MatformerLoadStrategy::Sliced)
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            InitRunError::MissingMatformerManifestTier { .. }
+        ));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn test_canonical_schema_hash_matches_full_and_sliced() {
+        let parameter_names = vec!["model.layers.0.mlp.gate_proj.weight".to_string()];
+        let config_full = json!({
+            "intermediate_size": 256
+        });
+        let config_slice = json!({
+            "intermediate_size": 128,
+            "matformer_tier": 1,
+            "matformer_base_intermediate_size": 256
+        });
+
+        let canonical_full = canonicalize_config_for_schema(config_full, 0, false);
+        let canonical_slice = canonicalize_config_for_schema(config_slice, 1, true);
+
+        assert_eq!(canonical_full["intermediate_size"], 256);
+        assert_eq!(canonical_slice["intermediate_size"], 256);
+        assert_eq!(canonical_full["matformer_base_intermediate_size"], 256);
+        assert_eq!(canonical_slice["matformer_base_intermediate_size"], 256);
+
+        let hash_full = schema_hash_for_config(
+            model::LLMArchitecture::HfLlama,
+            &canonical_full,
+            &parameter_names,
+        );
+        let hash_slice = schema_hash_for_config(
+            model::LLMArchitecture::HfLlama,
+            &canonical_slice,
+            &parameter_names,
+        );
+
+        assert_eq!(hash_full, hash_slice);
+    }
+
+    #[test]
+    fn test_normalize_manifest_paths_for_repo() {
+        let selection = ManifestSelection {
+            files: vec![
+                "../model-tier1/config.json".to_string(),
+                "../model-tier1/model.safetensors".to_string(),
+            ],
+            config_path: "../model-tier1/config.json".to_string(),
+        };
+        let normalized =
+            normalize_manifest_selection_for_repo("model/matformer_manifest.json", selection)
+                .unwrap();
+        assert_eq!(
+            normalized.files,
+            vec![
+                "model-tier1/config.json".to_string(),
+                "model-tier1/model.safetensors".to_string(),
+            ]
+        );
+        assert_eq!(normalized.config_path, "model-tier1/config.json");
+    }
+
+    #[test]
+    fn test_normalize_manifest_paths_root_parent_clamps() {
+        let selection = ManifestSelection {
+            files: vec!["../model-tier1/config.json".to_string()],
+            config_path: "../model-tier1/config.json".to_string(),
+        };
+        let normalized =
+            normalize_manifest_selection_for_repo("matformer_manifest.json", selection).unwrap();
+        assert_eq!(
+            normalized.files,
+            vec!["model-tier1/config.json".to_string()]
+        );
+        assert_eq!(normalized.config_path, "model-tier1/config.json");
+    }
+
+    #[test]
+    fn test_normalize_manifest_paths_rejects_absolute() {
+        let selection = ManifestSelection {
+            files: vec!["/etc/passwd".to_string()],
+            config_path: "/etc/passwd".to_string(),
+        };
+        let err =
+            normalize_manifest_selection_for_repo("matformer_manifest.json", selection).unwrap_err();
+        assert!(matches!(
+            err,
+            InitRunError::InvalidMatformerManifestPath { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_resolve_hub_manifest_paths() {
+        let repo_id = std::env::var("PSYCHE_HF_TEST_REPO")
+            .expect("PSYCHE_HF_TEST_REPO must be set for this test");
+        let token = std::env::var("PSYCHE_HF_TOKEN")
+            .expect("PSYCHE_HF_TOKEN must be set for this test");
+
+        let resolved = resolve_matformer_hub_repo_files(
+            &repo_id,
+            None,
+            1,
+            MatformerLoadStrategy::Sliced,
+            Some(token),
+            4,
+        )
+        .await
+        .expect("expected manifest-based tier resolution");
+
+        assert!(resolved.uses_sliced_checkpoint);
+        assert_eq!(resolved.sliced_checkpoint_tier, Some(1));
+        assert_eq!(resolved.matformer_tier_for_loading, 0);
+        assert_eq!(resolved.manifest_base_intermediate_size, Some(1024));
+        assert_eq!(resolved.checkpoint_path.as_deref(), Some("model-tier1"));
+        assert!(resolved
+            .repo_files
+            .iter()
+            .any(|path| path.ends_with(Path::new("model-tier1/config.json"))));
     }
 }
 
@@ -277,37 +509,477 @@ async fn resolve_matformer_local_repo_path(
     }
 }
 
-/// Infer matformer tier from checkpoint config.json.
-/// Returns (inferred_tier, base_intermediate_size) if determinable.
-fn infer_tier_from_checkpoint_config(config: &serde_json::Value) -> (Option<u8>, Option<u64>) {
-    let intermediate_size = config.get("intermediate_size").and_then(|v| v.as_u64());
+#[derive(Debug)]
+struct ManifestSelection {
+    files: Vec<String>,
+    config_path: String,
+}
 
-    // Check for explicit tier stored in checkpoint
-    if let Some(tier) = config.get("matformer_tier").and_then(|v| v.as_u64()) {
-        let base_size = config
-            .get("matformer_base_intermediate_size")
-            .and_then(|v| v.as_u64())
-            .or_else(|| {
-                // Infer base size from tier if not explicitly stored
-                intermediate_size.and_then(|size| size.checked_shl(tier as u32))
-            });
-        return (Some(tier as u8), base_size);
+#[derive(Debug)]
+struct ResolvedRepoFiles {
+    repo_files: Vec<PathBuf>,
+    uses_sliced_checkpoint: bool,
+    matformer_tier_for_loading: u8,
+    checkpoint_path: Option<String>,
+    manifest_base_intermediate_size: Option<u64>,
+    sliced_checkpoint_tier: Option<u8>,
+}
+
+fn ensure_manifest_supported(manifest: &MatformerManifest) -> Result<(), InitRunError> {
+    if manifest.schema_version != 1 {
+        return Err(InitRunError::UnsupportedMatformerManifestVersion {
+            version: manifest.schema_version,
+        });
+    }
+    Ok(())
+}
+
+fn select_manifest_tier_files(
+    manifest: &MatformerManifest,
+    tier: u8,
+) -> Result<ManifestSelection, InitRunError> {
+    ensure_manifest_supported(manifest)?;
+    let entry = manifest.tier_entry(tier).ok_or_else(|| {
+        InitRunError::MissingMatformerManifestTier {
+            tier,
+            available: manifest.available_tiers(),
+        }
+    })?;
+
+    let config_path = entry
+        .files
+        .iter()
+        .find(|path| path.ends_with("config.json"))
+        .cloned()
+        .ok_or(InitRunError::MatformerManifestMissingConfig { tier })?;
+
+    if !entry
+        .files
+        .iter()
+        .any(|path| path.ends_with(".safetensors"))
+    {
+        return Err(InitRunError::MatformerManifestMissingWeights { tier });
     }
 
-    // No explicit tier - check if base size stored (can infer tier)
-    if let (Some(base), Some(current)) = (
-        config.get("matformer_base_intermediate_size").and_then(|v| v.as_u64()),
-        intermediate_size,
-    ) {
-        if base > 0 && current > 0 && base >= current {
-            let ratio = base / current;
-            if ratio.is_power_of_two() {
-                return (Some(ratio.trailing_zeros() as u8), Some(base));
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for name in manifest
+        .common_files
+        .iter()
+        .chain(entry.files.iter())
+    {
+        if seen.insert(name) {
+            files.push(name.clone());
+        }
+    }
+
+    Ok(ManifestSelection {
+        files,
+        config_path,
+    })
+}
+
+async fn list_local_repo_files(dir: &Path) -> Result<Vec<PathBuf>, InitRunError> {
+    let mut ret = Vec::new();
+    let mut read_dir = tokio::fs::read_dir(dir).await?;
+    while let Some(dir_entry) = read_dir.next_entry().await? {
+        ret.push(dir_entry.path())
+    }
+    Ok(ret)
+}
+
+fn resolve_manifest_local_paths(
+    manifest_dir: &Path,
+    files: &[String],
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut resolved = Vec::with_capacity(files.len());
+    let mut missing = Vec::new();
+    for name in files {
+        let path = manifest_dir.join(Path::new(name));
+        if path.is_file() {
+            resolved.push(path);
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    (resolved, missing)
+}
+
+fn normalize_repo_relative_path(path: &Path, original: &str) -> Result<PathBuf, InitRunError> {
+    let mut parts: Vec<OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    // Clamp to repo root if the manifest path tries to traverse above it.
+                    continue;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(InitRunError::InvalidMatformerManifestPath {
+                    path: original.to_string(),
+                });
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(InitRunError::InvalidMatformerManifestPath {
+            path: original.to_string(),
+        });
+    }
+    let mut normalized = PathBuf::new();
+    for part in parts {
+        normalized.push(part);
+    }
+    Ok(normalized)
+}
+
+fn repo_path_to_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn normalize_manifest_selection_for_repo(
+    manifest_path: &str,
+    selection: ManifestSelection,
+) -> Result<ManifestSelection, InitRunError> {
+    let manifest_dir = Path::new(manifest_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let mut seen = HashSet::new();
+    let mut files = Vec::with_capacity(selection.files.len());
+    for entry in selection.files {
+        let entry = entry.trim_start_matches("./");
+        let combined = manifest_dir.join(entry);
+        let normalized = normalize_repo_relative_path(&combined, entry)?;
+        let normalized = repo_path_to_string(&normalized);
+        if seen.insert(normalized.clone()) {
+            files.push(normalized);
+        }
+    }
+
+    let config_entry = selection.config_path.trim_start_matches("./");
+    let config_combined = manifest_dir.join(config_entry);
+    let normalized_config = normalize_repo_relative_path(&config_combined, config_entry)?;
+    let normalized_config = repo_path_to_string(&normalized_config);
+
+    Ok(ManifestSelection {
+        files,
+        config_path: normalized_config,
+    })
+}
+
+async fn resolve_matformer_local_repo_files(
+    base: &Path,
+    tier: u8,
+    strategy: MatformerLoadStrategy,
+) -> Result<Option<ResolvedRepoFiles>, InitRunError> {
+    let base_exists = tokio::fs::try_exists(base).await?;
+    if !base_exists {
+        return Ok(None);
+    }
+
+    if tier == 0 {
+        return Ok(Some(ResolvedRepoFiles {
+            repo_files: list_local_repo_files(base).await?,
+            uses_sliced_checkpoint: false,
+            matformer_tier_for_loading: 0,
+            checkpoint_path: Some(base.to_string_lossy().to_string()),
+            manifest_base_intermediate_size: None,
+            sliced_checkpoint_tier: None,
+        }));
+    }
+
+    let manifest_path = base.join(MATFORMER_MANIFEST_NAME);
+    if tokio::fs::try_exists(&manifest_path).await? {
+        let manifest_contents = tokio::fs::read_to_string(&manifest_path).await?;
+        let manifest: MatformerManifest = serde_json::from_str(&manifest_contents)
+            .map_err(InitRunError::MatformerManifestParse)?;
+
+        if !matches!(strategy, MatformerLoadStrategy::Universal) {
+            match select_manifest_tier_files(&manifest, tier) {
+                Ok(selection) => {
+                    let (repo_files, missing) =
+                        resolve_manifest_local_paths(base, &selection.files);
+                    if missing.is_empty() {
+                        let config_path = base.join(Path::new(&selection.config_path));
+                        let checkpoint_path = config_path
+                            .parent()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .unwrap_or_else(|| config_path.to_string_lossy().to_string());
+                        return Ok(Some(ResolvedRepoFiles {
+                            repo_files,
+                            uses_sliced_checkpoint: true,
+                            matformer_tier_for_loading: 0,
+                            checkpoint_path: Some(checkpoint_path),
+                            manifest_base_intermediate_size: manifest
+                                .matformer_base_intermediate_size,
+                            sliced_checkpoint_tier: Some(tier),
+                        }));
+                    }
+
+                    let err = InitRunError::MissingMatformerManifestFiles { missing };
+                    if matches!(strategy, MatformerLoadStrategy::Sliced) {
+                        return Err(err);
+                    }
+                    warn!(error = %err, "Manifest files missing; falling back to local lookup");
+                }
+                Err(err) => {
+                    if matches!(strategy, MatformerLoadStrategy::Sliced) {
+                        return Err(err);
+                    }
+                    warn!(error = %err, "Manifest unusable; falling back to local lookup");
+                }
             }
         }
     }
 
-    (None, intermediate_size)
+    let (maybe_path, sliced_checkpoint) =
+        resolve_matformer_local_repo_path(base, tier, strategy).await?;
+    if let Some(repo_root) = maybe_path {
+        let effective_tier_for_load = if sliced_checkpoint { 0 } else { tier };
+        return Ok(Some(ResolvedRepoFiles {
+            repo_files: list_local_repo_files(&repo_root).await?,
+            uses_sliced_checkpoint: sliced_checkpoint,
+            matformer_tier_for_loading: effective_tier_for_load,
+            checkpoint_path: Some(repo_root.to_string_lossy().to_string()),
+            manifest_base_intermediate_size: None,
+            sliced_checkpoint_tier: sliced_checkpoint.then_some(tier),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn manifest_missing_repo_files(repo_files: &[String], expected: &[String]) -> Vec<String> {
+    let available: HashSet<&str> = repo_files.iter().map(|file| file.as_str()).collect();
+    expected
+        .iter()
+        .filter(|name| !available.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+async fn resolve_matformer_hub_repo_files(
+    repo_id: &str,
+    revision: Option<String>,
+    tier: u8,
+    strategy: MatformerLoadStrategy,
+    hub_read_token: Option<String>,
+    hub_max_concurrent_downloads: usize,
+) -> Result<ResolvedRepoFiles, InitRunError> {
+    if tier == 0 || matches!(strategy, MatformerLoadStrategy::Universal) {
+        let repo_files = download_model_repo_async(
+            repo_id,
+            revision,
+            None,
+            hub_read_token,
+            Some(hub_max_concurrent_downloads),
+            false,
+        )
+        .await?;
+        return Ok(ResolvedRepoFiles {
+            repo_files,
+            uses_sliced_checkpoint: false,
+            matformer_tier_for_loading: tier,
+            checkpoint_path: Some(repo_id.to_string()),
+            manifest_base_intermediate_size: None,
+            sliced_checkpoint_tier: None,
+        });
+    }
+
+    let repo_listing = list_model_repo_files_async(
+        repo_id,
+        revision.clone(),
+        None,
+        hub_read_token.clone(),
+        false,
+    )
+    .await?;
+
+    let manifest_paths: Vec<String> = repo_listing
+        .iter()
+        .filter(|path| path.ends_with(MATFORMER_MANIFEST_NAME))
+        .cloned()
+        .collect();
+
+    if manifest_paths.is_empty() {
+        if matches!(strategy, MatformerLoadStrategy::Sliced) {
+            return Err(InitRunError::MissingMatformerManifest {
+                path: format!("{repo_id}:{MATFORMER_MANIFEST_NAME}"),
+            });
+        }
+        let repo_files = download_model_repo_async(
+            repo_id,
+            revision,
+            None,
+            hub_read_token,
+            Some(hub_max_concurrent_downloads),
+            false,
+        )
+        .await?;
+        return Ok(ResolvedRepoFiles {
+            repo_files,
+            uses_sliced_checkpoint: false,
+            matformer_tier_for_loading: tier,
+            checkpoint_path: Some(repo_id.to_string()),
+            manifest_base_intermediate_size: None,
+            sliced_checkpoint_tier: None,
+        });
+    }
+
+    if manifest_paths.len() > 1 {
+        return Err(InitRunError::MultipleMatformerManifests {
+            paths: manifest_paths,
+        });
+    }
+
+    let manifest_path = manifest_paths[0].clone();
+    let manifest_files = download_model_repo_files_async(
+        repo_id,
+        revision.clone(),
+        None,
+        hub_read_token.clone(),
+        Some(hub_max_concurrent_downloads),
+        false,
+        &[manifest_path.clone()],
+    )
+    .await?;
+    let manifest_contents = tokio::fs::read_to_string(&manifest_files[0]).await?;
+    let manifest: MatformerManifest = serde_json::from_str(&manifest_contents)
+        .map_err(InitRunError::MatformerManifestParse)?;
+
+    let selection = match select_manifest_tier_files(&manifest, tier) {
+        Ok(selection) => selection,
+        Err(err) => {
+            if matches!(strategy, MatformerLoadStrategy::Sliced) {
+                return Err(err);
+            }
+            warn!(error = %err, "Manifest tier unavailable; falling back to universal");
+            let repo_files = download_model_repo_async(
+                repo_id,
+                revision,
+                None,
+                hub_read_token,
+                Some(hub_max_concurrent_downloads),
+                false,
+            )
+            .await?;
+            return Ok(ResolvedRepoFiles {
+                repo_files,
+                uses_sliced_checkpoint: false,
+                matformer_tier_for_loading: tier,
+                checkpoint_path: Some(repo_id.to_string()),
+                manifest_base_intermediate_size: None,
+                sliced_checkpoint_tier: None,
+            });
+        }
+    };
+
+    let selection = match normalize_manifest_selection_for_repo(&manifest_path, selection) {
+        Ok(selection) => selection,
+        Err(err) => {
+            if matches!(strategy, MatformerLoadStrategy::Sliced) {
+                return Err(err);
+            }
+            warn!(error = %err, "Manifest paths invalid; falling back to universal");
+            let repo_files = download_model_repo_async(
+                repo_id,
+                revision,
+                None,
+                hub_read_token,
+                Some(hub_max_concurrent_downloads),
+                false,
+            )
+            .await?;
+            return Ok(ResolvedRepoFiles {
+                repo_files,
+                uses_sliced_checkpoint: false,
+                matformer_tier_for_loading: tier,
+                checkpoint_path: Some(repo_id.to_string()),
+                manifest_base_intermediate_size: None,
+                sliced_checkpoint_tier: None,
+            });
+        }
+    };
+
+    let missing = manifest_missing_repo_files(&repo_listing, &selection.files);
+    if !missing.is_empty() {
+        let err = InitRunError::MissingMatformerManifestFiles { missing };
+        if matches!(strategy, MatformerLoadStrategy::Sliced) {
+            return Err(err);
+        }
+        warn!(error = %err, "Manifest files missing; falling back to universal");
+        let repo_files = download_model_repo_async(
+            repo_id,
+            revision,
+            None,
+            hub_read_token,
+            Some(hub_max_concurrent_downloads),
+            false,
+        )
+        .await?;
+        return Ok(ResolvedRepoFiles {
+            repo_files,
+            uses_sliced_checkpoint: false,
+            matformer_tier_for_loading: tier,
+            checkpoint_path: Some(repo_id.to_string()),
+            manifest_base_intermediate_size: None,
+            sliced_checkpoint_tier: None,
+        });
+    }
+
+    let repo_files = download_model_repo_files_async(
+        repo_id,
+        revision,
+        None,
+        hub_read_token,
+        Some(hub_max_concurrent_downloads),
+        false,
+        &selection.files,
+    )
+    .await?;
+    let checkpoint_path = Path::new(&selection.config_path)
+        .parent()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or(selection.config_path);
+    Ok(ResolvedRepoFiles {
+        repo_files,
+        uses_sliced_checkpoint: true,
+        matformer_tier_for_loading: 0,
+        checkpoint_path: Some(checkpoint_path),
+        manifest_base_intermediate_size: manifest.matformer_base_intermediate_size,
+        sliced_checkpoint_tier: Some(tier),
+    })
+}
+
+async fn resolve_matformer_repo_files(
+    repo_id: &str,
+    revision: Option<String>,
+    tier: u8,
+    strategy: MatformerLoadStrategy,
+    hub_read_token: Option<String>,
+    hub_max_concurrent_downloads: usize,
+) -> Result<ResolvedRepoFiles, InitRunError> {
+    if revision.is_none() {
+        let local_path = PathBuf::from(repo_id);
+        if let Some(resolved) =
+            resolve_matformer_local_repo_files(&local_path, tier, strategy).await?
+        {
+            return Ok(resolved);
+        }
+    }
+
+    resolve_matformer_hub_repo_files(
+        repo_id,
+        revision,
+        tier,
+        strategy,
+        hub_read_token,
+        hub_max_concurrent_downloads,
+    )
+    .await
 }
 
 fn apply_matformer_checkpoint_tier_overrides(
@@ -316,8 +988,9 @@ fn apply_matformer_checkpoint_tier_overrides(
     uses_sliced_checkpoint: bool,
     matformer_tier_for_loading: u8,
 ) -> (bool, u8) {
-    let (checkpoint_tier, _) = infer_tier_from_checkpoint_config(checkpoint_config);
-    let mut uses_sliced_checkpoint =
+    let checkpoint_metadata = infer_matformer_checkpoint_metadata(checkpoint_config);
+    let checkpoint_tier = checkpoint_metadata.tier;
+    let uses_sliced_checkpoint =
         uses_sliced_checkpoint || checkpoint_tier.map(|tier| tier > 0).unwrap_or(false);
     let mut matformer_tier_for_loading = matformer_tier_for_loading;
 
@@ -338,7 +1011,8 @@ fn validate_no_double_slicing(
     load_strategy: &MatformerLoadStrategy,
     uses_sliced_checkpoint: bool,
 ) -> Result<(), InitRunError> {
-    let (checkpoint_tier, _) = infer_tier_from_checkpoint_config(checkpoint_config);
+    let checkpoint_metadata = infer_matformer_checkpoint_metadata(checkpoint_config);
+    let checkpoint_tier = checkpoint_metadata.tier;
 
     // If we detected this is a sliced checkpoint (via naming or explicit tier)
     let is_sliced = uses_sliced_checkpoint || checkpoint_tier.map(|t| t > 0).unwrap_or(false);
@@ -391,15 +1065,30 @@ fn canonicalize_config_for_schema(
     matformer_tier: u8,
     uses_sliced_checkpoint: bool,
 ) -> serde_json::Value {
+    let mut base_intermediate_size = infer_matformer_checkpoint_metadata(&config)
+        .base_intermediate_size;
     if let Some(obj) = config.as_object_mut() {
-        if uses_sliced_checkpoint && matformer_tier > 0 {
-            if let Some(value) = obj.get_mut("intermediate_size") {
-                if let Some(base) = value.as_u64() {
-                    if let Some(scaled) = base.checked_shl(matformer_tier as u32) {
-                        *value = serde_json::Value::from(scaled);
-                    }
-                }
+        if uses_sliced_checkpoint {
+            let base = base_intermediate_size
+                .or_else(|| obj.get("intermediate_size").and_then(|v| v.as_u64()))
+                .or_else(|| {
+                    obj.get("intermediate_size")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|size| size.checked_shl(matformer_tier as u32))
+                });
+            if let Some(base) = base {
+                obj.insert("intermediate_size".to_string(), serde_json::Value::from(base));
+                base_intermediate_size = Some(base);
             }
+        }
+
+        if let Some(base) = base_intermediate_size
+            .or_else(|| obj.get("intermediate_size").and_then(|v| v.as_u64()))
+        {
+            obj.insert(
+                "matformer_base_intermediate_size".to_string(),
+                serde_json::Value::from(base),
+            );
         }
         // ALWAYS set matformer_tier to 0 for canonical comparison
         // This ensures full checkpoints (no field) and sliced checkpoints (field=0)
@@ -445,6 +1134,9 @@ pub enum InitRunError {
     #[error("could not parse config: {0}")]
     FailedToParseConfig(#[from] serde_json::Error),
 
+    #[error("failed to parse MatFormer manifest: {0}")]
+    MatformerManifestParse(serde_json::Error),
+
     #[error("Unsupported architecture: {0}")]
     UnsupportedArchitecture(String),
 
@@ -469,6 +1161,30 @@ pub enum InitRunError {
         cli_tier: u8,
         hint: String,
     },
+
+    #[error("MatFormer manifest missing at {path}")]
+    MissingMatformerManifest { path: String },
+
+    #[error("MatFormer manifest schema version {version} is unsupported")]
+    UnsupportedMatformerManifestVersion { version: u32 },
+
+    #[error("MatFormer manifest missing tier {tier}. Available tiers: {available:?}")]
+    MissingMatformerManifestTier { tier: u8, available: Vec<u8> },
+
+    #[error("MatFormer manifest missing config.json for tier {tier}")]
+    MatformerManifestMissingConfig { tier: u8 },
+
+    #[error("MatFormer manifest missing safetensors for tier {tier}")]
+    MatformerManifestMissingWeights { tier: u8 },
+
+    #[error("MatFormer manifest contains invalid path: {path}")]
+    InvalidMatformerManifestPath { path: String },
+
+    #[error("MatFormer manifest referenced missing files: {missing:?}")]
+    MissingMatformerManifestFiles { missing: Vec<String> },
+
+    #[error("Multiple MatFormer manifests found: {paths:?}")]
+    MultipleMatformerManifests { paths: Vec<String> },
 }
 
 enum RawLoadedModelType {
@@ -517,6 +1233,8 @@ struct LoadedCheckpoint {
     uses_sliced_checkpoint: bool,
     matformer_tier_for_loading: u8,
     matformer_checkpoint_path: Option<String>,
+    manifest_base_intermediate_size: Option<u64>,
+    sliced_checkpoint_tier: Option<u8>,
 }
 
 impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T, A> {
@@ -710,57 +1428,29 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     let loaded_checkpoint = match checkpoint {
                         model::Checkpoint::Hub(hub_repo) => {
                             let repo_id: String = (&hub_repo.repo_id).into();
-                            let potential_local_path = PathBuf::from(repo_id.clone());
                             let revision = hub_repo.revision.map(|bytes| (&bytes).into());
+                            let revision_for_log = revision.clone();
+                            let resolved = resolve_matformer_repo_files(
+                                &repo_id,
+                                revision,
+                                init_config.matformer_tier,
+                                init_config.matformer_load_strategy,
+                                init_config.hub_read_token.clone(),
+                                init_config.hub_max_concurrent_downloads,
+                            )
+                            .await?;
+                            let repo_files = resolved.repo_files;
+                            let checkpoint_path = resolved.checkpoint_path;
+                            let effective_tier_for_load = resolved.matformer_tier_for_loading;
+                            let sliced_checkpoint = resolved.uses_sliced_checkpoint;
+                            let manifest_base_intermediate_size =
+                                resolved.manifest_base_intermediate_size;
+                            let sliced_checkpoint_tier = resolved.sliced_checkpoint_tier;
 
-                            let (maybe_local_path, sliced_checkpoint) =
-                                resolve_matformer_local_repo_path(
-                                    &potential_local_path,
-                                    init_config.matformer_tier,
-                                    init_config.matformer_load_strategy,
-                                )
-                                .await?;
-
-                            let (repo_files, checkpoint_path, effective_tier_for_load) =
-                                if revision.is_none()
-                                    && maybe_local_path
-                                        .as_ref()
-                                        .map(|p| p.exists())
-                                        .unwrap_or(false)
-                                {
-                                    let repo_root = maybe_local_path.unwrap();
-                                    let mut ret = Vec::new();
-                                    let mut read_dir = tokio::fs::read_dir(repo_root.clone()).await?;
-                                    while let Some(dir_entry) = read_dir.next_entry().await? {
-                                        ret.push(dir_entry.path())
-                                    }
-                                    let effective_tier_for_load =
-                                        if sliced_checkpoint { 0 } else { init_config.matformer_tier };
-                                    (
-                                        ret,
-                                        Some(repo_root.to_string_lossy().to_string()),
-                                        effective_tier_for_load,
-                                    )
-                                } else {
-                                    info!(
-                                        "Downloading {}, revision: {:?} (if needed)",
-                                        hub_repo.repo_id, revision
-                                    );
-                                    let repo_files = download_model_repo_async(
-                                        &repo_id,
-                                        revision,
-                                        None,
-                                        init_config.hub_read_token,
-                                        Some(init_config.hub_max_concurrent_downloads),
-                                        false,
-                                    )
-                                    .await?;
-                                    (
-                                        repo_files,
-                                        Some(repo_id.clone()),
-                                        init_config.matformer_tier,
-                                    )
-                                };
+                            info!(
+                                "Resolved checkpoint {}, revision: {:?}",
+                                hub_repo.repo_id, revision_for_log
+                            );
                             let checkpoint_extra_files = repo_files
                                 .iter()
                                 .filter(|file| {
@@ -781,6 +1471,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                 uses_sliced_checkpoint: sliced_checkpoint,
                                 matformer_tier_for_loading: effective_tier_for_load,
                                 matformer_checkpoint_path: checkpoint_path,
+                                manifest_base_intermediate_size,
+                                sliced_checkpoint_tier,
                             }
                         }
                         model::Checkpoint::P2P(_) => {
@@ -847,6 +1539,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                 uses_sliced_checkpoint: false,
                                 matformer_tier_for_loading: init_config.matformer_tier,
                                 matformer_checkpoint_path: Some("p2p".to_string()),
+                                manifest_base_intermediate_size: None,
+                                sliced_checkpoint_tier: None,
                             }
                         }
                         _ => unreachable!(),
@@ -859,6 +1553,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     let mut matformer_tier_for_loading =
                         loaded_checkpoint.matformer_tier_for_loading;
                     let matformer_checkpoint_path = loaded_checkpoint.matformer_checkpoint_path;
+                    let manifest_base_intermediate_size =
+                        loaded_checkpoint.manifest_base_intermediate_size;
+                    let sliced_checkpoint_tier = loaded_checkpoint.sliced_checkpoint_tier;
 
                     info!("Loading model...");
 
@@ -878,8 +1575,13 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     );
 
                     let serialized_config = source.serialize_config()?;
-                    let config_json: serde_json::Value =
+                    let mut config_json: serde_json::Value =
                         serde_json::from_str(&serialized_config)?;
+                    ensure_matformer_checkpoint_metadata(
+                        &mut config_json,
+                        manifest_base_intermediate_size,
+                        sliced_checkpoint_tier,
+                    );
                     (uses_sliced_checkpoint, matformer_tier_for_loading) =
                         apply_matformer_checkpoint_tier_overrides(
                             &config_json,
@@ -1105,16 +1807,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             Some(h / divisor)
                         });
                         // Compute base intermediate size (before any tier slicing)
-                        // For sliced checkpoints, scale up by CLI tier to get original base
-                        let base_intermediate_size: Option<u64> = intermediate_size.and_then(|size| {
-                            if uses_sliced_checkpoint && init_config.matformer_tier > 0 {
-                                // Sliced checkpoint: scale up to get base
-                                size.checked_shl(init_config.matformer_tier as u32)
-                            } else {
-                                // Full checkpoint: intermediate_size IS the base
-                                Some(size)
-                            }
-                        });
+                        let checkpoint_metadata =
+                            infer_matformer_checkpoint_metadata(&config_json);
+                        let base_intermediate_size = checkpoint_metadata.base_intermediate_size;
                         let num_hidden_layers = config_json
                             .get("num_hidden_layers")
                             .and_then(|v| v.as_u64());

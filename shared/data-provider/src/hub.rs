@@ -78,6 +78,46 @@ async fn download_repo_async(
     Ok(ret)
 }
 
+async fn list_repo_files_async(
+    repo: Repo,
+    cache: Option<PathBuf>,
+    token: Option<String>,
+    progress_bar: bool,
+) -> Result<Vec<String>, ApiError> {
+    let builder = hf_hub::api::tokio::ApiBuilder::new();
+    let cache = match cache {
+        Some(cache) => Cache::new(cache),
+        None => Cache::default(),
+    };
+    let api = builder
+        .with_cache_dir(cache.path().clone())
+        .with_token(token.or(cache.token()))
+        .with_progress(progress_bar)
+        .build()?
+        .repo(repo);
+    let siblings = api.info().await?.siblings;
+    Ok(siblings.into_iter().map(|s| s.rfilename).collect())
+}
+
+pub async fn list_model_repo_files_async(
+    repo_id: &str,
+    revision: Option<String>,
+    cache: Option<PathBuf>,
+    token: Option<String>,
+    progress_bar: bool,
+) -> Result<Vec<String>, ApiError> {
+    list_repo_files_async(
+        match revision {
+            Some(revision) => Repo::with_revision(repo_id.to_string(), RepoType::Model, revision),
+            None => Repo::model(repo_id.to_string()),
+        },
+        cache,
+        token,
+        progress_bar,
+    )
+    .await
+}
+
 pub async fn download_model_repo_async(
     repo_id: &str,
     revision: Option<String>,
@@ -98,6 +138,65 @@ pub async fn download_model_repo_async(
         &MODEL_EXTENSIONS,
     )
     .await
+}
+
+pub async fn download_model_repo_files_async(
+    repo_id: &str,
+    revision: Option<String>,
+    cache: Option<PathBuf>,
+    token: Option<String>,
+    max_concurrent_downloads: Option<usize>,
+    progress_bar: bool,
+    files: &[String],
+) -> Result<Vec<PathBuf>, ApiError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let builder = hf_hub::api::tokio::ApiBuilder::new();
+    let cache = match cache {
+        Some(cache) => Cache::new(cache),
+        None => Cache::default(),
+    };
+    let api = builder
+        .with_cache_dir(cache.path().clone())
+        .with_token(token.or(cache.token()))
+        .with_progress(progress_bar)
+        .build()?
+        .repo(match revision {
+            Some(revision) => Repo::with_revision(repo_id.to_string(), RepoType::Model, revision),
+            None => Repo::model(repo_id.to_string()),
+        });
+
+    let chunk_size = max_concurrent_downloads.unwrap_or(files.len());
+    let api = &api;
+    let mut ret: Vec<PathBuf> = Vec::with_capacity(files.len());
+    for chunk in files.chunks(chunk_size) {
+        let futures = chunk
+            .iter()
+            .map(|name| {
+                let name = name.clone();
+                async move {
+                    let start_time = Instant::now();
+                    tracing::debug!(filename = name, "Starting file download from hub");
+                    let res = api.get(&name).await;
+                    if res.is_ok() {
+                        let duration_secs = (Instant::now() - start_time).as_secs_f32();
+                        tracing::info!(
+                            filename = name,
+                            duration_secs = duration_secs,
+                            "Finished downloading file from hub"
+                        );
+                    }
+                    res
+                }
+            })
+            .collect::<Vec<_>>();
+        for future in futures {
+            ret.push(future.await?);
+        }
+    }
+    Ok(ret)
 }
 
 pub async fn download_dataset_repo_async(
