@@ -1,18 +1,18 @@
 # psyche-elastic
 
 <p align="center" width="100%">
-    <img src="./psyche-book/src/psyche.jpg">
+<img src="https://github.com/user-attachments/assets/87c70aab-07c0-4df6-ab4f-b7f23776e427" />
 </p>
 
-**psyche-elastic** is a fork of **Psyche** focused on elastic, heterogeneous training. It is **built on top of Psyche** (PsycheFoundation/psyche) and extends it with MatFormer tiered checkpoints, manifest-based slicing, and practical tooling for mixed‑hardware training.
+**psyche-elastic** is a fork of **Psyche** focused on elastic, heterogeneous training. 
+The aim is train a `nanoGPT` on a FineWeb subset across the commodity internet, over different devices. 
+Currently, the codebase allows the training of GPT-esque models over a V100 and an A100 in tandem. However, large models that can train on an A100 easily cannot harness the V100. For this, we slice the model into different tiers, as in [Matformer: Nested Transformer for Elastic Inference](https://www.prateekjain.org/publications/all_papers/KuduguntaKDCDTHKFJ23.pdf). While the original paper describes how to _infer_ different model tiers, the current implementation extends the same to _training_. Coupling this with `psyche`'s Decoupled Momentum optimization, it allows training with steady convergence across different devices that need not have enough memory to hold the entire device, in a way such that each GPU actually has a measurable, positive impact on convergence.
 
-> All commits authored by `plugyawn` are my contributions.
+It is **built on top of Psyche** (PsycheFoundation/psyche) and extends it with MatFormer tiered checkpoints, manifest-based slicing, and practical tooling for mixed‑hardware training.
 
 For canonical Psyche documentation, see https://docs.psyche.network (upstream). This README adds the elastic workflow and fork‑specific details.
 
 ---
-
-## What This Unlocks
 
 - **Heterogeneous training**: smaller devices train smaller tiers; large devices train full tiers; all contribute to shared weights.
 - **Selective downloads**: tiered checkpoints pull only the files needed for a given tier (esp. from HF).
@@ -21,21 +21,8 @@ For canonical Psyche documentation, see https://docs.psyche.network (upstream). 
 
 ---
 
-## MatFormer Workflow (End‑to‑End)
+## Matryoshka Transformer
 
-```mermaid
-flowchart LR
-  A[Universal checkpoint<br/>(tier 0)] --> B[export_matformer_tiers.py]
-  B --> C[matformer_manifest.json]
-  B --> D[Tier dirs<br/>-tier1/-tier2/...]
-  C --> E[Client load strategy]
-  D --> E
-  E -->|auto| F[Sliced if complete; else universal]
-  E -->|sliced| G[Require sliced or fail]
-  E -->|universal| H[Always full]
-```
-
-Key points:
 - Tier slices are **prefixes** of the FFN width: tier 1 = 1/2, tier 2 = 1/4, etc.
 - Clients at smaller tiers update only prefix weights; shared prefixes receive gradients from all tiers.
 - Helper mode (stochastic suffix sampling) is **wired but currently disabled** until sparse alignment/rotation is finalized.
@@ -119,24 +106,9 @@ The loader prevents **double‑slicing** if a checkpoint is already tiered.
 
 ---
 
-## How It Works (High Level)
-
-```mermaid
-graph TD
-  C[Client joins] --> T[Select tier + load strategy]
-  T --> L[Load checkpoint
-(manifest-aware)]
-  L --> M[Model runs at tier]
-  M --> G[Gradients on prefix weights]
-  G --> A[Aggregate by parameter name]
-  A --> U[Update shared prefix]
-```
-
----
-
 ## What Changed in This Fork
 
-Key contributions (all `plugyawn` commits):
+Key contributions:
 
 - MatFormer tier slices, manifests, and hub selective downloads
 - Metadata inference + schema canonicalization for mixed tiers
