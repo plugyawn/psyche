@@ -4,7 +4,7 @@
 <img src="https://github.com/user-attachments/assets/87c70aab-07c0-4df6-ab4f-b7f23776e427" />
 </p>
 
-**psyche-elastic** is a fork of **Psyche** focused on elastic, heterogeneous training. 
+**psyche-elastic** is a fork of [**Psyche**](https://nousresearch.com/nous-psyche/), from Nous Research, focused on elastic, heterogeneous training. 
 The aim is train a `nanoGPT` on a FineWeb subset across the commodity internet, over different devices. 
 Currently, the codebase allows the training of GPT-esque models over a V100 and an A100 in tandem. However, large models that can train on an A100 easily cannot harness the V100. For this, we slice the model into different tiers, as in [Matformer: Nested Transformer for Elastic Inference](https://www.prateekjain.org/publications/all_papers/KuduguntaKDCDTHKFJ23.pdf). While the original paper describes how to _infer_ different model tiers, the current implementation extends the same to _training_. Coupling this with `psyche`'s Decoupled Momentum optimization, it allows training with steady convergence across different devices that need not have enough memory to hold the entire device, in a way such that each GPU actually has a measurable, positive impact on convergence.
 
