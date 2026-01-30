@@ -12,9 +12,18 @@ pub(crate) enum PrefixAlignError {
 }
 
 fn matformer_prefix_dim(name: &str) -> Option<usize> {
-    if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") {
+    if name.ends_with("gate_proj.weight")
+        || name.ends_with("up_proj.weight")
+        || name.ends_with("mlp_up.weight")
+        || name.contains(".mlp.c_fc.weight")
+        || name.contains(".mlp.fc1.weight")
+    {
         Some(0)
-    } else if name.ends_with("down_proj.weight") {
+    } else if name.ends_with("down_proj.weight")
+        || name.ends_with("mlp_down.weight")
+        || name.contains(".mlp.c_proj.weight")
+        || name.contains(".mlp.fc2.weight")
+    {
         Some(1)
     } else {
         None
@@ -1274,6 +1283,31 @@ mod tests {
         let full_shape = vec![2i64, 2i64];
         let aligned =
             align_matformer_prefix_grad("model.layers.0.mlp.down_proj.weight", &full_shape, grad)
+                .unwrap();
+        assert_eq!(aligned.size(), full_shape);
+        assert!(aligned.allclose(&_2d_float(&[[1.0, 2.0], [5.0, 6.0]]), 1e-6, 1e-6, false));
+    }
+
+    #[test]
+    fn test_align_matformer_prefix_grad_gpt2_fc() {
+        let grad = _2d_float(&[[1.0, 2.0], [3.0, 4.0]]);
+        let full_shape = vec![4i64, 2i64];
+        let aligned =
+            align_matformer_prefix_grad("model.layers.0.mlp.c_fc.weight", &full_shape, grad)
+                .unwrap();
+        assert_eq!(aligned.size(), full_shape);
+        let prefix = aligned.narrow(0, 0, 2);
+        let tail = aligned.narrow(0, 2, 2);
+        assert!(prefix.allclose(&_2d_float(&[[1.0, 2.0], [3.0, 4.0]]), 1e-6, 1e-6, false));
+        assert!(tail.allclose(&_2d_float(&[[0.0, 0.0], [0.0, 0.0]]), 1e-6, 1e-6, false));
+    }
+
+    #[test]
+    fn test_align_matformer_prefix_grad_gpt2_proj() {
+        let grad = _2d_float(&[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
+        let full_shape = vec![2i64, 2i64];
+        let aligned =
+            align_matformer_prefix_grad("model.layers.0.mlp.c_proj.weight", &full_shape, grad)
                 .unwrap();
         assert_eq!(aligned.size(), full_shape);
         assert!(aligned.allclose(&_2d_float(&[[1.0, 2.0], [5.0, 6.0]]), 1e-6, 1e-6, false));

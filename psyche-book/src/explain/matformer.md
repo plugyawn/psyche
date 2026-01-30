@@ -10,6 +10,17 @@ Traditional transformers require running the full model for every inference. Mat
 - **Elastic inference**: Deploy the same weights at multiple latency/quality points
 - **Behavioral consistency**: Smaller models closely match larger model outputs due to shared weights
 
+## Theoretical Foundation
+
+For a deep dive into the mathematical foundations of heterogeneous training, see [Heterogeneous Training Theory](./heterogeneous-training.md). Key concepts:
+
+- **Nested FFN granularities**: How prefix sharing enables multi-tier training
+- **Backpropagation decomposition**: Why gradients are cleanly separable per tier
+- **Sampling probabilities**: How client tier distribution affects convergence
+- **Sample rate asymmetry**: Why different gradient rates are mathematically sound
+
+The MatFormer paper (arXiv:2310.07707) sections 3.1-3.3 describe joint optimization across granularities. Psyche adapts this to distributed training where tier sampling is implicit (based on client mix) rather than explicit (per-step sampling).
+
 ## How It Works
 
 MatFormer primarily targets the **FFN (Feed-Forward Network)** blocks, which typically account for ~2/3 of transformer parameters. The technique works by:
@@ -212,6 +223,52 @@ When clients train at different tiers, gradients are computed only for the activ
 - **Tier 2** clients compute gradients for the first 25% of FFN neurons
 
 The shared prefix neurons receive gradient contributions from all clients, making them robust and general-purpose. Exclusive neurons (used only by larger tiers) are more specialized.
+
+### Loss Stability Guarantees
+
+Heterogeneous training maintains stable loss because:
+
+1. **Prefix sharing robustness**: Shared prefix weights receive gradients from ALL tiers, providing high gradient diversity for robust feature learning.
+
+2. **Sign-SGD magnitude invariance**: DisTrO uses `sign(gradient)` for communication. The direction `sign(g_tier0 + g_tier1)` is independent of individual magnitudes.
+
+3. **Peer count normalization**: The heterogeneous path normalizes by contributing peers, matching "mean" reduction in the homogeneous path.
+
+4. **Schema hash canonicalization**: All tiers hash to the same canonical config (tier=0), preventing incompatible clients from joining the same run.
+
+### Gradient Aggregation Deep Dive
+
+The DisTrO optimizer detects heterogeneous gradients and routes to the appropriate aggregation path:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DISTRO AGGREGATION PIPELINE                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Step 1: SHAPE DETECTION                                                    │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ let same_shape = results.iter().all(|x|                               │  │
+│  │     x[index].xshape == results[0][index].xshape                       │  │
+│  │ );                                                                    │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  Step 2a: HOMOGENEOUS PATH (same_shape=true)                                │
+│  - Batch decompress with single CUDA kernel                                 │
+│  - Fast: O(1) memory allocation, vectorized                                 │
+│                                                                             │
+│  Step 2b: HETEROGENEOUS PATH (same_shape=false)                             │
+│  - Per-peer decompress                                                      │
+│  - Align to local shape via align_matformer_prefix_grad()                   │
+│  - Sum aligned gradients                                                    │
+│  - Normalize by contributing_peers                                          │
+│                                                                             │
+│  Step 3: SIGN QUANTIZATION                                                  │
+│  - variable.grad().sign_() → Only direction matters                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+See [DisTrO optimizer](./distro.md) for compression details and [Heterogeneous Training Theory](./heterogeneous-training.md) for mathematical foundations.
 
 ### Parameter Naming
 

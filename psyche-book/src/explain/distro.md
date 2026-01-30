@@ -69,6 +69,110 @@ Clients broadcast their compressed updates via P2P gossip. The server aggregates
 3. Averaging across clients
 4. Applying to model weights
 
+## Heterogeneous Gradient Handling
+
+When clients train at different MatFormer tiers, gradients have different shapes. DisTrO handles this through automatic detection and alignment.
+
+### Shape Detection
+
+Before aggregation, DisTrO checks if all gradients have the same shape:
+
+```rust
+let same_shape = results.iter().all(|x| {
+    x[index].xshape == results[0][index].xshape
+        && x[index].totalk == results[0][index].totalk
+});
+```
+
+### Homogeneous Path (Fast)
+
+When all clients are the same tier, batch decompression uses optimized CUDA kernels:
+
+```rust
+let decompressed = CompressDCT::batch_decompress(
+    &indicies, &values, &xshape, totalk, val_kind, device,
+);
+```
+
+### Heterogeneous Path
+
+When tiers differ, each gradient is processed individually and aligned:
+
+```rust
+for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
+    let decompressed = CompressDCT::decompress(...);
+    let decoded = self.transform.decode(&decompressed);
+    let aligned = align_matformer_prefix_grad(name, &full_shape, decoded)?;
+    combined = Some(match combined {
+        Some(acc) => acc + aligned,
+        None => aligned,
+    });
+    contributing_peers += 1;
+}
+
+// Normalize by peer count (consistent with "mean" reduction)
+let normalized = combined / (contributing_peers as f64);
+```
+
+### Dimension-Aware Alignment
+
+FFN layers have different weight matrix orientations:
+
+| Layer | Shape | FFN Width Dimension |
+|-------|-------|---------------------|
+| `gate_proj`, `up_proj` | `[intermediate_size, hidden_size]` | Rows (dim=0) |
+| `down_proj` | `[hidden_size, intermediate_size]` | Columns (dim=1) |
+
+The `matformer_prefix_dim()` function uses parameter names to determine the correct alignment dimension:
+
+```rust
+fn matformer_prefix_dim(name: &str) -> Option<usize> {
+    if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") {
+        Some(0)  // FFN width in rows
+    } else if name.ends_with("down_proj.weight") {
+        Some(1)  // FFN width in columns
+    } else {
+        None     // Non-FFN parameter (attention, embeddings)
+    }
+}
+```
+
+### Gradient Expansion
+
+When a tier-1 client's gradient is smaller than the full model shape, it's expanded with zeros:
+
+```rust
+// Tier-1 gradient [512, 256] → Full shape [1024, 256]
+let expanded = Tensor::zeros(full_shape, (grad.kind(), grad.device()));
+let mut prefix_view = expanded.narrow(prefix_dim, 0, grad_len);
+prefix_view.copy_(&grad);  // Prefix filled, suffix zeros
+```
+
+### Aggregation Semantics
+
+The heterogeneous path normalizes by `contributing_peers` to match the "mean" semantics of the batch decompress path:
+
+```rust
+let normalized = if contributing_peers > 1 {
+    combined / (contributing_peers as f64)
+} else {
+    combined
+};
+var.set_grad(normalized);
+```
+
+This ensures consistent gradient scale regardless of tier mix.
+
+### Sign-SGD Final Step
+
+After aggregation, Sign-SGD extracts only the direction:
+
+```rust
+let _t = variable.grad().sign_();
+```
+
+This makes the final update invariant to gradient magnitude differences between tiers.
+
 ## Configuration
 
 ```toml

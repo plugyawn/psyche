@@ -269,6 +269,30 @@ impl LocalDataProvider {
     }
 
     fn internal_get_samples(&self, data_ids: BatchId) -> Result<Vec<TokenizedData>> {
+        let data_ids = match std::env::var("PSYCHE_FORCE_SAME_BATCH") {
+            Ok(value) if is_truthy_env_bool(&value) => {
+                let len = data_ids.len() as u64;
+                if len == 0 {
+                    return Ok(Vec::new());
+                }
+                if len as usize > self.sequences.len() {
+                    bail!(
+                        "PSYCHE_FORCE_SAME_BATCH requested {} samples, but dataset has only {}",
+                        len,
+                        self.sequences.len()
+                    );
+                }
+                let start = std::env::var("PSYCHE_FORCE_SAME_BATCH_START")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let max_start = self.sequences.len().saturating_sub(len as usize) as u64;
+                let start = start.min(max_start);
+                BatchId(ClosedInterval::new(start, start + len - 1))
+            }
+            _ => data_ids,
+        };
+
         let mut ret: Vec<_> = Vec::new();
         for data_id in data_ids.iter() {
             let SequencePointer {

@@ -8,6 +8,8 @@
   - [Model sharing](./explain/model-sharing.md)
   - [DisTrO optimizer](./explain/distro.md)
   - [MatFormer](./explain/matformer.md)
+  - [Heterogeneous Training](./explain/heterogeneous-training.md)
+    - [Technical Reference](./explain/heterogeneous-training-reference.md)
   - [Rewards](./explain/rewards.md)
   - [Glossary](./explain/glossary.md)
 
@@ -29,3 +31,5 @@
   - [Building these docs](./development/book.md)
   - [CI](./development/ci.md)
   - [Contributing](./development/contributing.md)
+  - [MatFormer Evolution](./development/matformer-evolution.md)
+  - [MatFormer Verification](./development/matformer-verification.md)

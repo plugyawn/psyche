@@ -10,7 +10,7 @@ command = "mdbook-mermaid"
 [output]
 
 [output.html]
-additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-js = ["mathjax-config.js", "mermaid.min.js", "mermaid-init.js"]
 additional-css = ["./theme/psyche.css"]
 default-theme = "psyche-light"
 preferred-dark-theme = "psyche-dark"
