@@ -1,13 +1,15 @@
 use crate::{
     AllReduce, CausalLM, Communicator, CommunicatorId, CudaSynchronize, Distro, DistroResult,
     EosToks, Fp32GradientAccumulator, Optimizer, ReduceType, StableVariableIterator,
-    unsharded_cpu_variables,
+    save_tensors_into_safetensors, unsharded_cpu_variables,
 };
 use anyhow::{Error, Result};
 use psyche_core::{Barrier, BatchId, LearningRateSchedule, OptimizerDefinition};
+use regex::Regex;
 use std::{
     collections::HashMap,
     ops::ControlFlow,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -29,6 +31,63 @@ pub struct ParallelModels {
 }
 
 pub type DistroResults = Vec<DistroResult>;
+
+struct RawGradConfig {
+    dir: PathBuf,
+    every: u32,
+    max_steps: Option<u32>,
+    filter: Option<Regex>,
+    layer: Option<u32>,
+    identity: String,
+}
+
+impl RawGradConfig {
+    fn from_env() -> Option<Self> {
+        let dir = std::env::var("PSYCHE_RAW_GRADS_DIR").ok()?;
+        let dir = PathBuf::from(dir);
+        let every = std::env::var("PSYCHE_RAW_GRADS_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1);
+        let max_steps = std::env::var("PSYCHE_RAW_GRADS_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0);
+        let filter = match std::env::var("PSYCHE_RAW_GRADS_FILTER") {
+            Ok(pattern) if !pattern.trim().is_empty() => Regex::new(&pattern).ok(),
+            _ => None,
+        };
+        let layer = std::env::var("PSYCHE_RAW_GRADS_LAYER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        let identity = std::env::var("RAW_IDENTITY_SECRET_KEY").unwrap_or_else(|_| "unknown".into());
+        Some(Self {
+            dir,
+            every,
+            max_steps,
+            filter,
+            layer,
+            identity,
+        })
+    }
+
+    fn should_log(&self, step: u32) -> bool {
+        if step % self.every != 0 {
+            return false;
+        }
+        match self.max_steps {
+            Some(max_steps) => step < max_steps,
+            None => true,
+        }
+    }
+
+    fn batch_tag(batch_id: BatchId) -> String {
+        let mut tag = format!("{batch_id}");
+        tag = tag.replace(['[', ']', ',', ' '], "_");
+        tag
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BatchDataCPU {
@@ -769,6 +828,8 @@ impl LocalTrainer {
         }
         model.prepare_for_training();
 
+        let raw_grad_config = RawGradConfig::from_env();
+
         let mut grad_accum: Option<Fp32GradientAccumulator> = None;
         let mut nonce = 0;
         loop {
@@ -1018,6 +1079,45 @@ impl LocalTrainer {
                                     None => true,
                                 };
                                 if clipped {
+                                    if index == 0 {
+                                        if let Some(config) = &raw_grad_config {
+                                            if config.should_log(step) {
+                                                let mut grads: HashMap<String, Tensor> = HashMap::new();
+                                                for variable in model.variables() {
+                                                    let name = variable.name();
+                                                    if let Some(layer) = config.layer {
+                                                        let needle = format!("layers.{layer}.");
+                                                        if !name.contains(&needle) {
+                                                            continue;
+                                                        }
+                                                    }
+                                                    if let Some(filter) = &config.filter {
+                                                        if !filter.is_match(name) {
+                                                            continue;
+                                                        }
+                                                    }
+                                                    let grad = variable.local_tensor().grad();
+                                                    if !grad.defined() {
+                                                        continue;
+                                                    }
+                                                    grads.insert(name.to_string(), grad.to_device(Device::Cpu));
+                                                }
+                                                if !grads.is_empty() {
+                                                    let dir = config
+                                                        .dir
+                                                        .join(format!("step{:05}", step))
+                                                        .join(format!(
+                                                            "client-{}-{}",
+                                                            config.identity,
+                                                            RawGradConfig::batch_tag(batch.id)
+                                                        ));
+                                                    if let Err(err) = save_tensors_into_safetensors(grads, dir) {
+                                                        warn!("Failed to write raw grads: {err:#}");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     let ret = optimizer.generate(
                                         model.as_ref(),
                                         &prev_self_distro_results.unwrap_or_default(),
